@@ -21,16 +21,24 @@ logger = logging.getLogger("nadirclaw.routing")
 # Model Pool — weighted load balancing across multiple models
 # ---------------------------------------------------------------------------
 
-def _parse_model_pools() -> Dict[str, List[Tuple[str, int]]]:
-    """Parse NADIRCLAW_MODEL_POOLS env var into pool configuration.
+# Lazy-initialized: pools are built on first access, not at import time,
+# so CLI `serve --set NADIRCLAW_MODEL_POOLS=...` works correctly.
+_MODEL_POOLS_CACHE: Optional[Dict[str, List[Tuple[str, int]]]] = None
+_MODEL_TO_POOL_CACHE: Optional[Dict[str, str]] = None
+_POOL_LOCK = Lock()
+
+
+def _parse_model_pools() -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, str]]:
+    """Parse NADIRCLAW_MODEL_POOLS env var into pool + reverse-map.
 
     Format: "pool_name=model1,weight1+model2,weight2;pool_name2=..."
     Example: "turbo=glm-5-turbo,10+kimi-K2.6-code-preview,9+minimax-MiniMax-M2.7,3"
     """
     raw = os.getenv("NADIRCLAW_MODEL_POOLS", "")
     if not raw:
-        return {}
+        return {}, {}
     pools: Dict[str, List[Tuple[str, int]]] = {}
+    reverse: Dict[str, str] = {}
     for pool_def in raw.split(";"):
         pool_def = pool_def.strip()
         if not pool_def or "=" not in pool_def:
@@ -56,39 +64,46 @@ def _parse_model_pools() -> Dict[str, List[Tuple[str, int]]]:
                 weight = 1
             if model_name:
                 entries.append((model_name, weight))
+                reverse[model_name] = pool_name
         if entries:
             pools[pool_name] = entries
-    return pools
+    return pools, reverse
 
 
-_MODEL_POOLS_CACHE: Optional[Dict[str, List[Tuple[str, int]]]] = None
-_MODEL_TO_POOL_CACHE: Optional[Dict[str, str]] = None
-
-
-def _ensure_pools_loaded() -> None:
+def _ensure_pools_loaded() -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, str]]:
+    """Lazily build and cache model pools on first routing call."""
     global _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
-    if _MODEL_POOLS_CACHE is not None:
-        return
-    _env_file = Path.home() / ".nadirclaw" / ".env"
-    if _env_file.exists():
-        from dotenv import load_dotenv
-        load_dotenv(_env_file, override=False)
-    _MODEL_POOLS_CACHE = _parse_model_pools()
-    _MODEL_TO_POOL_CACHE = {}
-    for pool_name, models in _MODEL_POOLS_CACHE.items():
-        for model_name, _ in models:
-            _MODEL_TO_POOL_CACHE[model_name] = pool_name
+    if _MODEL_POOLS_CACHE is None:
+        with _POOL_LOCK:
+            if _MODEL_POOLS_CACHE is None:
+                _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE = _parse_model_pools()
+    return _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+
+
+def reload_pools() -> None:
+    """Force re-read of model pools from env (useful after serve --set)."""
+    global _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+    with _POOL_LOCK:
+        _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE = _parse_model_pools()
 
 
 def select_from_pool(pool_name: str) -> str:
-    """Select a model from the pool using weighted random selection."""
-    _ensure_pools_loaded()
-    pool = _MODEL_POOLS_CACHE.get(pool_name)
+    """Select a model from the pool using weighted random selection.
+
+    Args:
+        pool_name: Name of the pool (e.g., "turbo", "reasoning").
+
+    Returns:
+        Selected model name.
+
+    Raises:
+        KeyError: If pool_name is not a configured pool.
+    """
+    pools, _ = _ensure_pools_loaded()
+    pool = pools.get(pool_name)
     if not pool:
-        logger.warning("Unknown model pool: %s", pool_name)
-        return ""
-    models, weights = zip(*pool)
-    total_weight = sum(weights)
+        raise KeyError(f"Unknown model pool: {pool_name!r}. Available: {list(pools.keys())}")
+    total_weight = sum(w for _, w in pool)
     r = random.randint(1, total_weight)
     cumulative = 0
     for model, weight in pool:
@@ -104,9 +119,8 @@ def select_from_pool(pool_name: str) -> str:
 
 def get_pool_for_model(model: str) -> Optional[str]:
     """Return the pool name for a given model, or None if not in any pool."""
-    _ensure_pools_loaded()
-    return _MODEL_TO_POOL_CACHE.get(model)
-
+    _, reverse = _ensure_pools_loaded()
+    return reverse.get(model)
 
 # ---------------------------------------------------------------------------
 # Model registry — context windows and capabilities
