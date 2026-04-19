@@ -1,23 +1,29 @@
 """Anthropic Messages API compatibility layer for NadirClaw.
 
 Provides /v1/messages endpoint that accepts Anthropic SDK format requests,
-converts them to internal OpenAI format, routes through NadirClaw's smart
-routing, and returns responses in Anthropic format.
+routes them through NadirClaw's smart routing, and returns responses in
+Anthropic format.
 
-This enables tools that use the Anthropic SDK (e.g., Claude Code) to work
-with NadirClaw as a transparent proxy.
+For providers with Anthropic-compatible endpoints (e.g. third-party proxies),
+the original Anthropic request body is forwarded directly — no format
+conversion needed. This avoids the double-conversion overhead and
+format-compatibility issues that arise from Anthropic→OpenAI→Anthropic.
+
+For non-Anthropic providers (vLLM, Ollama, OpenAI), the request is converted
+to OpenAI format and sent through LiteLLM.
 
 Uses the proven "fake streaming" approach: waits for complete response from
-the upstream model, then emits Anthropic SSE events. This avoids the complex
-and error-prone real-time OpenAI→Anthropic stream conversion.
+the upstream model, then emits Anthropic SSE events.
 """
 
 import json
 import logging
+import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -26,6 +32,125 @@ from nadirclaw.settings import settings
 logger = logging.getLogger("nadirclaw.anthropic_api")
 
 router = APIRouter()
+
+# Provider env-var mapping for Anthropic-compatible endpoints.
+# Format: provider_name → (api_base_env_var, api_key_env_var)
+_ANTHROPIC_COMPAT_PROVIDERS: Dict[str, Tuple[str, str]] = {
+    "zai": ("ZAI_API_BASE", "ZAI_API_KEY"),
+    "kimi": ("KIMI_API_BASE", "KIMI_API_KEY"),
+    "minimax": ("MINIMAX_API_BASE", "MINIMAX_API_KEY"),
+    "anthropic": ("ANTHROPIC_API_BASE", "ANTHROPIC_API_KEY"),
+}
+
+# Providers that serve Anthropic-native endpoints — no format conversion needed.
+_ANTHROPIC_NATIVE_PROVIDERS = set(_ANTHROPIC_COMPAT_PROVIDERS)
+
+
+def get_anthropic_compat_endpoint(
+    provider: str,
+) -> Optional[Tuple[str, str]]:
+    """Return (api_base, api_key) if the provider has an Anthropic-compatible endpoint."""
+    if provider not in _ANTHROPIC_COMPAT_PROVIDERS:
+        return None
+    base_env, key_env = _ANTHROPIC_COMPAT_PROVIDERS[provider]
+    api_base = os.getenv(base_env, "")
+    api_key = os.getenv(key_env, "")
+    if not api_base or not api_key:
+        return None
+    # Normalize: strip trailing slash to avoid double-slash issues
+    api_base = api_base.rstrip("/")
+    return api_base, api_key
+
+
+async def call_anthropic_direct(
+    api_base: str,
+    api_key: str,
+    model: str,
+    body: Dict[str, Any],
+    timeout: float = 600.0,
+) -> Dict[str, Any]:
+    """Call an Anthropic-compatible endpoint directly, no format conversion.
+
+    Forwards the original Anthropic request body verbatim and returns the
+    raw Anthropic response.  This avoids the Anthropic→OpenAI→Anthropic
+    double-conversion that can cause format issues on some providers.
+    """
+    url = f"{api_base}/v1/messages"
+
+    # Build the Anthropic request body from the original
+    ant_body: Dict[str, Any] = {"model": model, "max_tokens": body.get("max_tokens", 4096)}
+    if body.get("messages"):
+        ant_body["messages"] = body["messages"]
+    if body.get("system"):
+        ant_body["system"] = body["system"]
+    if body.get("tools"):
+        ant_body["tools"] = body["tools"]
+    if body.get("tool_choice"):
+        ant_body["tool_choice"] = body["tool_choice"]
+    if body.get("thinking"):
+        ant_body["thinking"] = body["thinking"]
+    if body.get("temperature") is not None:
+        ant_body["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        ant_body["top_p"] = body["top_p"]
+    if body.get("stop_sequences"):
+        ant_body["stop_sequences"] = body["stop_sequences"]
+    if body.get("metadata"):
+        ant_body["metadata"] = body["metadata"]
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    # Forward beta headers if present
+    beta = body.get("anthropic_beta", "")
+    if beta:
+        headers["anthropic-beta"] = beta
+
+    logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
+    async with httpx.AsyncClient(timeout=settings.REQUEST_TIMEOUT) as client:
+        resp = await client.post(url, headers=headers, json=ant_body)
+
+    if resp.status_code >= 400:
+        error_text = resp.text[:500]
+        logger.warning(
+            "Direct Anthropic call failed (%s): %s", resp.status_code, error_text,
+        )
+        from litellm.exceptions import (
+            AuthenticationError as LiteLLMAuthError,
+            BadRequestError as LiteLLMBadRequestError,
+            InternalServerError as LiteLLMInternalServerError,
+            RateLimitError as LiteLLMRateLimitError,
+        )
+        if resp.status_code == 400:
+            raise LiteLLMBadRequestError(
+                message=error_text, model=model, llm_provider="anthropic",
+            )
+        if resp.status_code == 401:
+            raise LiteLLMAuthError(
+                message=error_text, model=model, llm_provider="anthropic",
+            )
+        if resp.status_code == 429:
+            raise LiteLLMRateLimitError(
+                message=error_text, model=model, llm_provider="anthropic",
+            )
+        raise LiteLLMInternalServerError(
+            message=error_text, model=model, llm_provider="anthropic",
+        )
+
+    return resp.json()
+
+
+def anthropic_response_to_stats(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract stats from a raw Anthropic response for logging/telemetry."""
+    usage = data.get("usage", {})
+    return {
+        "prompt_tokens": usage.get("input_tokens", 0),
+        "completion_tokens": usage.get("output_tokens", 0),
+        "stop_reason": data.get("stop_reason", ""),
+        "model": data.get("model", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +473,119 @@ def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _extract_anthropic_text(data: Dict[str, Any]) -> str:
+    """Extract concatenated text from an Anthropic response."""
+    parts = []
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            parts.append(block.get("text", ""))
+    return "\n".join(parts)
+
+
+def _extract_anthropic_tool_calls(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Extract tool_calls in OpenAI-compatible format from an Anthropic response."""
+    result = []
+    for block in data.get("content", []):
+        if block.get("type") == "tool_use":
+            result.append({
+                "id": block.get("id", ""),
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": json.dumps(block.get("input", {})),
+                },
+            })
+    return result
+
+
+def _build_anthropic_streaming_response_from_raw(
+    request_id: str,
+    model: str,
+    raw_response: Dict[str, Any],
+):
+    """Build SSE stream from a raw Anthropic response (direct path)."""
+    from sse_starlette.sse import EventSourceResponse
+
+    async def event_generator():
+        usage = raw_response.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        msg_id = raw_response.get("id", f"msg_{request_id}")
+
+        yield {
+            "event": "message_start",
+            "data": json.dumps({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                },
+            }),
+        }
+
+        block_index = 0
+        for block in raw_response.get("content", []):
+            block_type = block.get("type", "text")
+            yield {
+                "event": "content_block_start",
+                "data": json.dumps({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": block,
+                }),
+            }
+            if block_type == "text":
+                yield {
+                    "event": "content_block_delta",
+                    "data": json.dumps({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {"type": "text_delta", "text": block.get("text", "")},
+                    }),
+                }
+            elif block_type == "tool_use":
+                yield {
+                    "event": "content_block_delta",
+                    "data": json.dumps({
+                        "type": "content_block_delta",
+                        "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(block.get("input", {})),
+                        },
+                    }),
+                }
+            yield {
+                "event": "content_block_stop",
+                "data": json.dumps({"type": "content_block_stop", "index": block_index}),
+            }
+            block_index += 1
+
+        yield {
+            "event": "message_delta",
+            "data": json.dumps({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": raw_response.get("stop_reason", "end_turn"),
+                    "stop_sequence": raw_response.get("stop_sequence"),
+                },
+                "usage": {"output_tokens": output_tokens},
+            }),
+        }
+        yield {
+            "event": "message_stop",
+            "data": json.dumps({"type": "message_stop"}),
+        }
+
+    return EventSourceResponse(event_generator(), media_type="text/event-stream")
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -356,13 +594,16 @@ def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
 async def anthropic_messages(raw_request: Request):
     """Anthropic Messages API compatibility endpoint.
 
-    Uses the proven "fake streaming" approach from 0.11.0:
-    - All claude-* models → "auto" for smart routing
-    - Wait for complete response, then emit SSE events
-    - Reuses the same routing pipeline as /v1/chat/completions
+    Two call paths based on target provider:
+    - Path A (Anthropic-compatible): Direct httpx call, original body forwarded verbatim.
+      No format conversion needed — avoids Anthropic→OpenAI→Anthropic double-conversion.
+    - Path B (non-Anthropic): Convert to OpenAI format, call through LiteLLM.
+
+    Both paths share the same routing pipeline for model selection.
     """
     from nadirclaw.server import (
         _call_with_fallback,
+        _dispatch_model,
         _extract_request_metadata,
         _log_request,
         _smart_route_full,
@@ -531,25 +772,146 @@ async def anthropic_messages(raw_request: Request):
                 logger.info("Pool %s: %s → %s", pool_name, selected_model, pool_model)
                 selected_model = pool_model
 
-    # Call model with fallback (non-streaming)
+    # Call model — two paths based on provider type
     from nadirclaw.credentials import detect_provider
     provider = detect_provider(selected_model)
+
+    # Build fallback chain for this tier
+    tier = analysis_info.get("tier", "simple")
+    fallback_chain = settings.get_tier_fallback_chain(tier)
+    # Remove the primary model from the chain
+    fallback_chain = [m for m in fallback_chain if m != selected_model]
 
     try:
         from nadirclaw.telemetry import record_llm_call, trace_span
 
-        with trace_span("anthropic_messages", {"nadirclaw.tier": analysis_info.get("tier")}) as span:
-            response_data, selected_model, analysis_info = await _call_with_fallback(
-                selected_model, request, provider, analysis_info,
-            )
+        with trace_span("anthropic_messages", {"nadirclaw.tier": tier}) as span:
+            # Try direct Anthropic call first, then fallback chain
+            raw_response = None
+            fallback_from = None
+            final_model = selected_model
+
+            # Build candidate list: primary + fallback chain
+            candidates = [selected_model] + fallback_chain
+
+            for candidate_model in candidates:
+                candidate_provider = detect_provider(candidate_model)
+                candidate_endpoint = (
+                    get_anthropic_compat_endpoint(candidate_provider)
+                    if candidate_provider else None
+                )
+
+                if candidate_endpoint:
+                    # Path A: Direct Anthropic call
+                    try:
+                        api_base, api_key = candidate_endpoint
+                        raw_response = await call_anthropic_direct(
+                            api_base=api_base,
+                            api_key=api_key,
+                            model=candidate_model,
+                            body=body,
+                        )
+                        final_model = candidate_model
+                        if candidate_model != selected_model:
+                            fallback_from = selected_model
+                        break
+                    except Exception as e:
+                        logger.warning(
+                            "Direct Anthropic call failed for %s: %s — trying next",
+                            candidate_model, str(e)[:200],
+                        )
+                        continue
+                else:
+                    # Path B: Convert to OpenAI and use LiteLLM (single try).
+                    # Use _dispatch_model directly — one try per candidate.
+                    # Do NOT use _call_with_fallback here; it has its own
+                    # internal chain that would consume all LiteLLM candidates
+                    # and bypass the outer loop's direct-Anthropic path.
+                    logger.info(
+                        "LiteLLM call for %s (provider=%s)",
+                        candidate_model, candidate_provider,
+                    )
+                    response_data = await _dispatch_model(
+                        candidate_model, request, candidate_provider,
+                    )
+                    final_model = candidate_model
+                    if final_model != selected_model:
+                        fallback_from = selected_model
+                    # response_data is in OpenAI format — convert to Anthropic for return
+                    elapsed_ms = int((time.time() - start_time) * 1000)
+                    stats = {
+                        "prompt_tokens": response_data.get("prompt_tokens", 0),
+                        "completion_tokens": response_data.get("completion_tokens", 0),
+                    }
+                    record_llm_call(
+                        span, model=final_model, provider=candidate_provider,
+                        prompt_tokens=stats["prompt_tokens"],
+                        completion_tokens=stats["completion_tokens"],
+                        tier=tier, latency_ms=elapsed_ms,
+                    )
+                    _log_request({
+                        "type": "anthropic_messages",
+                        "request_id": request_id,
+                        "prompt": prompt_text[:2000],
+                        "selected_model": final_model,
+                        "tier": tier,
+                        "fallback_used": fallback_from,
+                        "total_latency_ms": elapsed_ms,
+                        **stats,
+                        "status": "ok",
+                        "call_path": "litellm_fallback",
+                        **req_meta,
+                    })
+                    display_model = body.get("model", "") or final_model
+                    if ant_stream:
+                        return _build_anthropic_streaming_response(
+                            request_id, display_model, response_data,
+                        )
+                    return JSONResponse(
+                        content=openai_response_to_anthropic(
+                            response_data, display_model, request_id,
+                        ),
+                        headers={"content-type": "application/json"},
+                    )
+
+            if raw_response is None:
+                raise RuntimeError(f"All models failed in fallback chain for tier={tier}")
+
+            # --- Success via direct Anthropic path ---
+            stats = anthropic_response_to_stats(raw_response)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             record_llm_call(
-                span, model=selected_model, provider=provider,
-                prompt_tokens=response_data.get("prompt_tokens", 0),
-                completion_tokens=response_data.get("completion_tokens", 0),
-                tier=analysis_info.get("tier"), latency_ms=elapsed_ms,
+                span, model=final_model, provider=detect_provider(final_model),
+                prompt_tokens=stats["prompt_tokens"],
+                completion_tokens=stats["completion_tokens"],
+                tier=tier, latency_ms=elapsed_ms,
             )
+
+            _log_request({
+                "type": "anthropic_messages",
+                "request_id": request_id,
+                "prompt": prompt_text[:2000],
+                "selected_model": final_model,
+                "tier": tier,
+                "fallback_used": fallback_from,
+                "total_latency_ms": elapsed_ms,
+                "prompt_tokens": stats["prompt_tokens"],
+                "completion_tokens": stats["completion_tokens"],
+                "status": "ok",
+                "call_path": "direct_anthropic",
+                **req_meta,
+            })
+
+            display_model = body.get("model", "") or final_model
+            if ant_stream:
+                return _build_anthropic_streaming_response_from_raw(
+                    request_id, display_model, raw_response,
+                )
+            return JSONResponse(
+                content=raw_response, headers={"content-type": "application/json"},
+            )
+
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error("Anthropic messages error: %s", e, exc_info=True)
@@ -558,31 +920,3 @@ async def anthropic_messages(raw_request: Request):
             "status": "error", "error": str(e), "total_latency_ms": elapsed_ms,
         })
         raise HTTPException(status_code=500, detail=f"Internal error. Request ID: {request_id}")
-
-    elapsed_ms = int((time.time() - start_time) * 1000)
-
-    # Log with fallback indicator
-    _log_request({
-        "type": "anthropic_messages",
-        "request_id": request_id,
-        "prompt": prompt_text[:2000],
-        "selected_model": selected_model,
-        "tier": analysis_info.get("tier"),
-        "fallback_used": analysis_info.get("fallback_from"),
-        "total_latency_ms": elapsed_ms,
-        "prompt_tokens": response_data.get("prompt_tokens", 0),
-        "completion_tokens": response_data.get("completion_tokens", 0),
-        "status": "ok",
-        **req_meta,
-    })
-
-    # Return in Anthropic format
-    display_model = body.get("model", "") or selected_model
-
-    if ant_stream:
-        return _build_anthropic_streaming_response(request_id, display_model, response_data)
-
-    return JSONResponse(
-        content=openai_response_to_anthropic(response_data, display_model, request_id),
-        headers={"content-type": "application/json"},
-    )
