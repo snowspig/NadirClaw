@@ -1517,6 +1517,48 @@ async def chat_completions(
                 "optimizations_applied": opt_result.optimizations_applied,
             }
 
+        # ------------------------------------------------------------------
+        # Context compression — dedup + truncate old turns
+        # Runs AFTER optimization, BEFORE dispatch
+        # ------------------------------------------------------------------
+        compression_info = None
+        if settings.CONTEXT_COMPRESSION and len(request.messages) > settings.COMPRESS_MIN_MESSAGES:
+            from nadirclaw.compress import compress_messages
+
+            msg_dicts = []
+            for m in request.messages:
+                d: Dict[str, Any] = {"role": m.role, "content": m.content}
+                extra = m.model_extra or {}
+                if "tool_calls" in extra:
+                    d["tool_calls"] = extra["tool_calls"]
+                if "tool_call_id" in extra:
+                    d["tool_call_id"] = extra["tool_call_id"]
+                if "name" in extra:
+                    d["name"] = extra["name"]
+                msg_dicts.append(d)
+            compressed_msgs, comp_stats = compress_messages(msg_dicts)
+            if comp_stats.get("compressed"):
+                rebuilt_msgs = []
+                for d in compressed_msgs:
+                    extras: Dict[str, Any] = {}
+                    if "tool_calls" in d:
+                        extras["tool_calls"] = d["tool_calls"]
+                    if "tool_call_id" in d:
+                        extras["tool_call_id"] = d["tool_call_id"]
+                    if "name" in d:
+                        extras["name"] = d["name"]
+                    rebuilt_msgs.append(
+                        ChatMessage(role=d["role"], content=d.get("content"), **extras)
+                    )
+                request = request.model_copy(update={"messages": rebuilt_msgs})
+                compression_info = comp_stats
+                logger.info(
+                    "Context compressed: %d → %d messages (deduped=%d, truncated=%d, ratio=%.2f)",
+                    comp_stats["messages_before"], comp_stats["messages_after"],
+                    comp_stats["deduped"], comp_stats["truncated"],
+                    comp_stats["compression_ratio"],
+                )
+
         # Resolve provider credential
         from nadirclaw.credentials import detect_provider, get_credential
 
