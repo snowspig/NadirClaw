@@ -393,6 +393,18 @@ _REASONING_MARKERS = re.compile(
 )
 
 
+# Patterns that indicate auto-injected context (not real user requests)
+_CONTEXT_INJECTION_PATTERNS = re.compile(
+    r"(?i)("
+    r"the following (is|are) the user'?s?\s*(claude\.md|claudemd|gemini\.md|agents\.md)"
+    r"|contents of .*claude\.md"
+    r"|project instructions.*checked into"
+    r"|user'?s?\s*private global instructions"
+    r"|codebase and user instructions"
+    r")"
+)
+
+
 def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     """Detect if a prompt requires reasoning capabilities.
 
@@ -402,6 +414,16 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     System messages in Claude Code contain many reasoning-related instructions
     that would cause false positives for every request.
     """
+    # Skip reasoning detection for auto-injected context (CLAUDE.md, etc.)
+    # These are background context injections, not user requests
+    if _CONTEXT_INJECTION_PATTERNS.search(prompt[:500]):
+        return {
+            "is_reasoning": False,
+            "marker_count": 0,
+            "markers": [],
+            "skipped": "context_injection",
+        }
+
     # Only check user prompt, ignore system_message to avoid false positives
     matches = _REASONING_MARKERS.findall(prompt)
     marker_count = len(matches)
