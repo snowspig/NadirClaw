@@ -352,35 +352,38 @@ def _count_agentic_cycles(messages: List[Any]) -> int:
 # Reasoning detection
 # ---------------------------------------------------------------------------
 
-_REASONING_MARKERS = re.compile(
-    r"("  # No start boundary check for Chinese support
-    # English markers (stronger indicators)
-    r"step\s*by\s*step"  # Allow "step by step" or "step-by-step"
-    r"|chain\s*of\s*thought"
-    r"|let'?s?\s+reason\s+about"
-    r"|reasoning\s+(?:task|problem|question)"
-    r"|prove\s+(?:that|this|the)\s+(?:by|using|with)"
-    r"|formal\s+(?:proof|verification)"
-    r"|mathematical(?:ly)?\s+(?:prove|show|derive)"
-    r"|derive\s+(?:the|a|an)\s+(?:formula|equation|result)"
-    r"|analyze\s+the\s+(?:tradeoffs?|trade-offs?|implications?|consequences?)"
-    r"|compare\s+and\s+contrast"
-    r"|pros?\s+and\s+cons?"
-    r"|advantages?\s+and\s+disadvantages?"
-    r"|tradeoffs?"
-    r"|trade-offs?"
-    r"|critically\s+(?:analyze|assess|examine)"
-    r"|explain\s+(?:the\s+)?reasoning"
-    r"|break\s+(?:this|it)\s+down\s+step"
-    r"|logical(?:ly)?\s+(?:deduce|infer|conclude)"
-    r"|analyze\s+why\s+(?:this|the|it)"
-    r"|diagnose\s+the\s+(?:root\s+)?cause"
-    r"|weigh\s+(?:the\s+)?(?:pros|cons|options|alternatives)"
-    r"|evaluate\s+(?:the\s+)?(?:options|alternatives|tradeoffs)"
-    r"|design\s+(?:a\s+)?(?:system|architecture)\s+(?:that|with)"
-    r"|architectural\s+(?:decision|choice)"
-    # Chinese markers (中文推理标记词) - strong indicators
-    r"|一步步"
+_REASONING_MARKERS_EN = re.compile(
+    r"\b("
+    r"step[- ]by[- ]step"
+    r"|think (?:through|carefully|deeply|about)"
+    r"|chain[- ]of[- ]thought"
+    r"|let'?s? reason"
+    r"|reason(?:ing)? (?:about|through)"
+    r"|prove (?:that|this|the)"
+    r"|formal (?:proof|verification)"
+    r"|mathematical(?:ly)? (?:prove|show|derive)"
+    r"|derive (?:the|a|an)"
+    r"|analyze the (?:tradeoffs?|trade-offs?|implications?|consequences?)"
+    r"|compare and contrast"
+    r"|what are the (?:pros? and cons?|advantages? and disadvantages?)"
+    r"|evaluate (?:the|whether|if)"
+    r"|critically (?:analyze|assess|examine)"
+    r"|explain (?:why|how|the reasoning)"
+    r"|work through"
+    r"|break (?:this|it) down"
+    r"|logical(?:ly)? (?:deduce|infer|conclude)"
+    r"|analyze why (?:this|the|it)"
+    r"|diagnose the (?:root )?cause"
+    r"|weigh (?:the )?(?:pros|cons|options|alternatives)"
+    r"|architectural (?:decision|choice)"
+    r"|design (?:a )?(?:system|architecture)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_REASONING_MARKERS_ZH = re.compile(
+    r"("
+    r"一步步"
     r"|逐步分析"
     r"|深入思考"
     r"|深入分析"
@@ -395,15 +398,19 @@ _REASONING_MARKERS = re.compile(
     r"|比较.*差异"
     r"|优缺点"
     r"|批判性分析"
+    r"|证明以下"
+    r"|证明这个"
+    r"|推导公式"
+    r"|推导结论"
     r"|详细解释.*原因"
-    r"|阐述.*原因"
-    r"|论证\s+(?:以下|这个)"
-    r"|演绎\s+(?:推理|证明)"
-    r"|归纳\s+(?:推理|总结)"
-    r"|设计.*系统.*(?:要求|支持)"
-    r"|设计一个.*(?:架构|方案)"
-    r")",  # No boundary check for Chinese support
-    re.IGNORECASE,
+    r"|论证以下"
+    r"|论证这个"
+    r"|演绎推理"
+    r"|归纳推理"
+    r"|设计.*系统"
+    r"|设计.*方案"
+    r")",
+>>>>>>> feature/complex-coding-reasoning
 )
 
 
@@ -423,24 +430,19 @@ _CONTEXT_INJECTION_PATTERNS = re.compile(
 def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     """Detect if a prompt requires reasoning capabilities.
 
+    Uses separate regexes for English (with \\b word boundaries) and Chinese
+    (without \\b, since CJK characters have no word boundaries).
+
     Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
 
     NOTE: Only checks the user prompt, NOT the system message.
     System messages in Claude Code contain many reasoning-related instructions
     that would cause false positives for every request.
     """
-    # Skip reasoning detection for auto-injected context (CLAUDE.md, etc.)
-    # These are background context injections, not user requests
-    if _CONTEXT_INJECTION_PATTERNS.search(prompt[:500]):
-        return {
-            "is_reasoning": False,
-            "marker_count": 0,
-            "markers": [],
-            "skipped": "context_injection",
-        }
-
-    # Only check user prompt, ignore system_message to avoid false positives
-    matches = _REASONING_MARKERS.findall(prompt)
+    combined = f"{system_message} {prompt}"
+    en_matches = _REASONING_MARKERS_EN.findall(combined)
+    zh_matches = _REASONING_MARKERS_ZH.findall(combined)
+    matches = list(set(en_matches + zh_matches))
     marker_count = len(matches)
 
     # 1+ markers = reasoning task
@@ -449,7 +451,7 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     return {
         "is_reasoning": is_reasoning,
         "marker_count": marker_count,
-        "markers": list(set(matches)),
+        "markers": matches,
     }
 
 
@@ -722,24 +724,16 @@ _REVIEW_MARKERS = re.compile(
 )
 
 
-def detect_code_review(
-    prompt: str,
-    last_user_text: str = "",
-) -> Dict[str, Any]:
-    """Detect if a prompt is a code review/verification task.
-
-    Code review tasks should route to Sonnet for high-quality analysis.
+def detect_code_review(prompt: str, system_message: str = "") -> Dict[str, Any]:
+    """Detect code review/verification tasks.
 
     Returns {"is_review": bool, "confidence": float, "signals": list}.
     """
     confidence = 0.0
     signals: List[str] = []
 
-    # Use last user text if available, otherwise use prompt
-    text_to_check = last_user_text or prompt
-
-    # Check for review keywords
-    if _REVIEW_MARKERS.search(text_to_check):
+    text = f"{system_message}\n{prompt}" if system_message else prompt
+    if _REVIEW_MARKERS.search(text):
         confidence = 0.90
         signals.append("review_keywords")
 
