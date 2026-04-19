@@ -961,6 +961,10 @@ async def _call_litellm(
             openai_base = os.getenv("OPENAI_API_BASE", "")
             if openai_base:
                 call_kwargs["api_base"] = openai_base
+                # LiteLLM needs the openai/ prefix to route correctly
+                if not litellm_model.startswith("openai/"):
+                    litellm_model = f"openai/{litellm_model}"
+                    call_kwargs["model"] = litellm_model
             if not api_key:
                 api_key = get_credential("anthropic")
         if api_key:
@@ -1250,6 +1254,9 @@ async def _call_with_fallback(
 
         failed_models = [selected_model]
         last_error = primary_error
+        fallback_reasons: list[dict[str, str]] = [
+            {"model": selected_model, "reason": str(primary_error)[:200], "path": "primary"}
+        ]
 
         for fallback_model in chain:
             logger.warning(
@@ -1272,12 +1279,18 @@ async def _call_with_fallback(
                     "fallback_chain_tried": failed_models,
                     "selected_model": fallback_model,
                     "strategy": analysis_info.get("strategy", "smart-routing") + "+fallback",
+                    "fallback_reasons": fallback_reasons,
                 }
                 return response_data, fallback_model, analysis_info
             except (RateLimitExhausted, Exception) as chain_error:
                 if isinstance(chain_error, HTTPException):
                     raise
                 failed_models.append(fallback_model)
+                fallback_reasons.append({
+                    "model": fallback_model,
+                    "reason": str(chain_error)[:200],
+                    "path": "fallback",
+                })
                 last_error = chain_error
                 continue
 
@@ -1607,6 +1620,7 @@ async def chat_completions(
                     "daily_spend": budget_status["daily_spend"],
                     "response_preview": _stream_analysis.get("_stream_content_preview", "[streamed]")[:200],
                     "fallback_used": _stream_analysis.get("fallback_from"),
+                    "fallback_reasons": _stream_analysis.get("fallback_reasons"),
                     "streaming": True,
                     "status": "error" if _stream_analysis.get("_stream_error") else "ok",
                     **_stream_req_meta,
@@ -1678,6 +1692,7 @@ async def chat_completions(
             "daily_spend": budget_status["daily_spend"],
             "response_preview": (response_data["content"] or "")[:100],
             "fallback_used": analysis_info.get("fallback_from"),
+            "fallback_reasons": analysis_info.get("fallback_reasons"),
             "status": "ok",
             **req_meta,
             **(optimization_info or {}),

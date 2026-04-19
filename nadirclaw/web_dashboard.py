@@ -49,7 +49,7 @@ async def dashboard_stats(
     from nadirclaw.savings import calculate_actual_cost, get_model_cost
 
     entries = _load_recent_logs(500)
-    completions = [e for e in entries if e.get("type") in ("completion", "anthropic_messages") and e.get("status") == "ok"]
+    completions = [e for e in entries if e.get("type") in ("completion", "anthropic_messages")]
 
     # Tier distribution
     tiers: Dict[str, int] = {}
@@ -81,7 +81,22 @@ async def dashboard_stats(
     recent = []
     for e in completions[:20]:
         prompt = (e.get("prompt", "") or "")[:80]
-        response = (e.get("response_preview", "") or "")[:120]
+        response = (e.get("response", "") or e.get("response_preview", "") or "")[:120]
+        if e.get("status") == "error":
+            error_msg = e.get("error", "")[:120]
+            response = f"[ERROR] {error_msg}"
+        # Build fallback reason summary for tooltip
+        fb_reasons = e.get("fallback_reasons") or []
+        fb_summary = ""
+        if fb_reasons and isinstance(fb_reasons, list):
+            parts = []
+            for fr in fb_reasons:
+                if isinstance(fr, dict):
+                    model = fr.get("model", "?")
+                    reason = fr.get("reason", "")[:80]
+                    parts.append(f"{model}: {reason}")
+            fb_summary = " | ".join(parts)
+
         recent.append({
             "time": e.get("timestamp", ""),
             "model": e.get("selected_model", ""),
@@ -92,6 +107,7 @@ async def dashboard_stats(
             "prompt": prompt,
             "response": response,
             "fallback": e.get("fallback_used"),
+            "fallback_reasons": fb_summary,
             "tokens_saved": e.get("tokens_saved", 0) or 0,
         })
 
@@ -448,7 +464,7 @@ async function refresh() {
     for (const r of d.recent_requests) {
       const t = r.time ? new Date(r.time).toLocaleTimeString() : '-';
       const tc = TIER_CLASSES[r.tier] || 'tier-direct';
-      const fb = r.fallback ? ' <span class="fallback-tag">⚡fallback</span>' : '';
+      const fb = r.fallback ? ' <span class="fallback-tag" title="' + (r.fallback_reasons||'').replace(/"/g,'&quot;') + '">⚡fallback</span>' : '';
       const resp = (r.response || '').replace(/</g,'&lt;').substring(0, 150) || (r.prompt||'').replace(/</g,'&lt;').substring(0, 80);
       rb.innerHTML += '<tr><td>' + t + '</td><td style="font-size:0.75rem">' + r.model + fb + '</td><td><span class="tier-badge ' + tc + '">' + r.tier + '</span></td><td>' + (r.latency_ms||0) + 'ms</td><td>' + r.tokens + '</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + resp + '</td></tr>';
     }

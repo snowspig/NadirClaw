@@ -1156,8 +1156,17 @@ async def anthropic_messages(raw_request: Request):
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error("Anthropic messages error: %s", e, exc_info=True)
+        err_extra = req_meta if "req_meta" in dir() else {}
         _log_request({
-            "type": "anthropic_messages", "request_id": request_id,
-            "status": "error", "error": str(e), "total_latency_ms": elapsed_ms,
+            "type": "anthropic_messages",
+            "request_id": request_id,
+            "prompt": display_prompt,
+            "selected_model": selected_model,
+            "tier": analysis_info.get("tier", ""),
+            "status": "error",
+            "error": str(e)[:500],
+            "fallback_reasons": fallback_reasons if "fallback_reasons" in dir() else None,
+            "total_latency_ms": elapsed_ms,
+            **err_extra,
         })
         raise HTTPException(status_code=500, detail=f"Internal error. Request ID: {request_id}")
