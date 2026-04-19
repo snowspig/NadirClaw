@@ -19,6 +19,7 @@ the upstream model, then emits Anthropic SSE events.
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -159,6 +160,24 @@ async def call_anthropic_direct(
         )
 
     return resp.json()
+
+
+# Pattern to strip system-reminder tags from display text.
+# Handles both closed (<system-reminder>...</system-reminder>) and
+# unclosed tags (<system-reminder>...\n\nReal text after).
+_SYSTEM_REMINDER_RE = re.compile(
+    r"<system-reminder>.*?</system-reminder>"   # closed tags
+    r"|<system-reminder>.*?(?=\n\n\S|$)",       # unclosed: strip to blank-line boundary
+    re.DOTALL,
+)
+
+
+def _clean_display_text(text: str) -> str:
+    """Strip <system-reminder> blocks from text for log display."""
+    if not text:
+        return text
+    cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+    return cleaned if cleaned else ""
 
 
 def anthropic_response_to_stats(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -592,6 +611,40 @@ def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _extract_display_prompt(messages: List[Dict[str, Any]]) -> str:
+    """Extract user text for log display, skipping system-reminder-only messages."""
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text = "\n".join(
+                b.get("text", "")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+        elif isinstance(content, str):
+            text = content
+        else:
+            continue
+        cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+        if cleaned:
+            return cleaned[:2000]
+    return ""
+
+
+def _extract_response_text(data: Dict[str, Any]) -> str:
+    """Extract text from an Anthropic response for log display."""
+    parts = []
+    for block in data.get("content", []):
+        if block.get("type") == "text" and block.get("text"):
+            parts.append(block["text"])
+        elif block.get("type") == "tool_use":
+            parts.append(f"[tool:{block.get('name', '')}]")
+    text = "\n".join(parts)
+    return _clean_display_text(text)[:500]
+
+
 def _extract_anthropic_text(data: Dict[str, Any]) -> str:
     """Extract concatenated text from an Anthropic response."""
     parts = []
@@ -776,6 +829,7 @@ async def anthropic_messages(raw_request: Request):
         ant_max_tokens = _MAX_ANTHROPIC_TOKENS
 
     prompt_text = _extract_last_user_text(body.get("messages", []))
+    display_prompt = _extract_display_prompt(body.get("messages", []))
 
     # Convert to OpenAI format
     openai_messages = anthropic_to_openai_messages(
@@ -940,6 +994,7 @@ async def anthropic_messages(raw_request: Request):
             # Try direct Anthropic call first, then fallback chain
             raw_response = None
             fallback_from = None
+            fallback_reasons: list[dict[str, str]] = []
             final_model = selected_model
 
             # Build candidate list: primary + fallback chain
@@ -982,10 +1037,16 @@ async def anthropic_messages(raw_request: Request):
                             fallback_from = selected_model
                         break
                     except Exception as e:
+                        err_msg = str(e)[:200]
                         logger.warning(
                             "Direct Anthropic call failed for %s: %s — trying next",
-                            candidate_model, str(e)[:200],
+                            candidate_model, err_msg,
                         )
+                        fallback_reasons.append({
+                            "model": candidate_model,
+                            "reason": err_msg,
+                            "path": "direct_anthropic",
+                        })
                         continue
                 else:
                     # Path B: Convert to OpenAI and use LiteLLM (single try).
@@ -1018,10 +1079,12 @@ async def anthropic_messages(raw_request: Request):
                     _log_request({
                         "type": "anthropic_messages",
                         "request_id": request_id,
-                        "prompt": prompt_text[:2000],
+                        "prompt": display_prompt,
+                        "response": _clean_display_text(response_data.get("content", ""))[:500],
                         "selected_model": final_model,
                         "tier": tier,
                         "fallback_used": fallback_from,
+                        "fallback_reasons": fallback_reasons or None,
                         "total_latency_ms": elapsed_ms,
                         **stats,
                         "status": "ok",
@@ -1047,9 +1110,19 @@ async def anthropic_messages(raw_request: Request):
             stats = anthropic_response_to_stats(raw_response)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
+            # Some providers (GLM, Kimi) report inaccurate input_tokens.
+            # Use our own estimate when upstream reports suspiciously low values.
+            reported_pt = stats["prompt_tokens"]
+            # Estimate from raw body: system + messages + tools
+            est_chars = len(json.dumps(body.get("system", "")))
+            est_chars += len(json.dumps(body.get("messages", [])))
+            est_chars += len(json.dumps(body.get("tools", [])))
+            estimated_pt = est_chars // 4
+            prompt_tokens = max(reported_pt, estimated_pt)
+
             record_llm_call(
                 span, model=final_model, provider=detect_provider(final_model),
-                prompt_tokens=stats["prompt_tokens"],
+                prompt_tokens=prompt_tokens,
                 completion_tokens=stats["completion_tokens"],
                 tier=tier, latency_ms=elapsed_ms,
             )
@@ -1057,12 +1130,14 @@ async def anthropic_messages(raw_request: Request):
             _log_request({
                 "type": "anthropic_messages",
                 "request_id": request_id,
-                "prompt": prompt_text[:2000],
+                "prompt": display_prompt,
+                "response": _extract_response_text(raw_response),
                 "selected_model": final_model,
                 "tier": tier,
                 "fallback_used": fallback_from,
+                "fallback_reasons": fallback_reasons or None,
                 "total_latency_ms": elapsed_ms,
-                "prompt_tokens": stats["prompt_tokens"],
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": stats["completion_tokens"],
                 "status": "ok",
                 "call_path": "direct_anthropic",

@@ -93,6 +93,10 @@ app = FastAPI(
 from nadirclaw.web_dashboard import router as dashboard_router
 app.include_router(dashboard_router)
 
+# Register Anthropic Messages API compatibility layer
+from nadirclaw.anthropic_api import router as anthropic_router
+app.include_router(anthropic_router)
+
 _ROUTING_HEADERS = ("X-Routed-Model", "X-Routed-Tier", "X-Complexity-Score")
 
 app.add_middleware(
@@ -176,8 +180,29 @@ class ClassifyBatchRequest(BaseModel):
 _log_lock = Lock()
 
 
+_SYSTEM_REMINDER_RE = re.compile(
+    r"<system-reminder>.*?</system-reminder>"   # closed tags
+    r"|<system-reminder>.*?(?=\n\n\S|$)",       # unclosed: strip to blank-line boundary
+    re.DOTALL,
+)
+
+
+def _clean_display_text(text: str) -> str:
+    """Strip <system-reminder> blocks from text for log display."""
+    if not text:
+        return text
+    cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
+    return cleaned if cleaned else ""
+
+
 def _log_request(entry: Dict[str, Any]) -> None:
     """Append a JSON line to the request log and print to console."""
+    # Clean display-only fields
+    if "prompt" in entry:
+        entry["prompt"] = _clean_display_text(entry["prompt"])
+    if "system_prompt_text" in entry:
+        entry["system_prompt_text"] = _clean_display_text(entry["system_prompt_text"])
+
     log_dir = settings.LOG_DIR
     log_dir.mkdir(parents=True, exist_ok=True)
     request_log = log_dir / "requests.jsonl"
@@ -1453,7 +1478,7 @@ async def chat_completions(
         # ------------------------------------------------------------------
         # Context compression — truncate old tool output for long sessions
         # ------------------------------------------------------------------
-        if getattr(settings, 'CONTEXT_COMPRESSION', 'false').lower() in ('true', '1', 'yes'):
+        if getattr(settings, 'CONTEXT_COMPRESSION', False):
             from nadirclaw.compress import compress_messages
             if len(request.messages) > 30:
                 # Preserve tool_calls, tool_call_id, name from model_extra
@@ -1469,7 +1494,7 @@ async def chat_completions(
                         d["name"] = extra["name"]
                     msg_dicts.append(d)
                 compressed, comp_stats = compress_messages(msg_dicts)
-                if not comp_stats.get("skipped"):
+                if comp_stats.get("compressed", False):
                     logger.info("Context compression: %d→%d msgs, ratio=%.2f",
                                comp_stats["messages_before"], comp_stats["messages_after"],
                                comp_stats["compression_ratio"])
@@ -1516,48 +1541,6 @@ async def chat_completions(
                 "tokens_saved": opt_result.tokens_saved,
                 "optimizations_applied": opt_result.optimizations_applied,
             }
-
-        # ------------------------------------------------------------------
-        # Context compression — dedup + truncate old turns
-        # Runs AFTER optimization, BEFORE dispatch
-        # ------------------------------------------------------------------
-        compression_info = None
-        if settings.CONTEXT_COMPRESSION and len(request.messages) > settings.COMPRESS_MIN_MESSAGES:
-            from nadirclaw.compress import compress_messages
-
-            msg_dicts = []
-            for m in request.messages:
-                d: Dict[str, Any] = {"role": m.role, "content": m.content}
-                extra = m.model_extra or {}
-                if "tool_calls" in extra:
-                    d["tool_calls"] = extra["tool_calls"]
-                if "tool_call_id" in extra:
-                    d["tool_call_id"] = extra["tool_call_id"]
-                if "name" in extra:
-                    d["name"] = extra["name"]
-                msg_dicts.append(d)
-            compressed_msgs, comp_stats = compress_messages(msg_dicts)
-            if comp_stats.get("compressed"):
-                rebuilt_msgs = []
-                for d in compressed_msgs:
-                    extras: Dict[str, Any] = {}
-                    if "tool_calls" in d:
-                        extras["tool_calls"] = d["tool_calls"]
-                    if "tool_call_id" in d:
-                        extras["tool_call_id"] = d["tool_call_id"]
-                    if "name" in d:
-                        extras["name"] = d["name"]
-                    rebuilt_msgs.append(
-                        ChatMessage(role=d["role"], content=d.get("content"), **extras)
-                    )
-                request = request.model_copy(update={"messages": rebuilt_msgs})
-                compression_info = comp_stats
-                logger.info(
-                    "Context compressed: %d → %d messages (deduped=%d, truncated=%d, ratio=%.2f)",
-                    comp_stats["messages_before"], comp_stats["messages_after"],
-                    comp_stats["deduped"], comp_stats["truncated"],
-                    comp_stats["compression_ratio"],
-                )
 
         # Resolve provider credential
         from nadirclaw.credentials import detect_provider, get_credential
@@ -2772,6 +2755,85 @@ def _build_anthropic_streaming_response(
     return EventSourceResponse(event_generator(), media_type="text/event-stream")
 
 
+def _build_anthropic_streaming_response_from_raw(
+    request_id: str, model: str, raw_response: dict,
+) -> EventSourceResponse:
+    """Build SSE stream from a raw Anthropic response (direct call path)."""
+
+    async def event_generator():
+        usage = raw_response.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        msg_id = raw_response.get("id", f"msg_{request_id}")
+
+        yield {
+            "event": "message_start",
+            "data": json.dumps({
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "model": model, "content": [],
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                },
+            }),
+        }
+
+        block_index = 0
+        for block in raw_response.get("content", []):
+            block_type = block.get("type", "text")
+            yield {
+                "event": "content_block_start",
+                "data": json.dumps({
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": block,
+                }),
+            }
+            if block_type == "text":
+                yield {
+                    "event": "content_block_delta",
+                    "data": json.dumps({
+                        "type": "content_block_delta", "index": block_index,
+                        "delta": {"type": "text_delta", "text": block.get("text", "")},
+                    }),
+                }
+            elif block_type == "tool_use":
+                yield {
+                    "event": "content_block_delta",
+                    "data": json.dumps({
+                        "type": "content_block_delta", "index": block_index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(block.get("input", {})),
+                        },
+                    }),
+                }
+            yield {
+                "event": "content_block_stop",
+                "data": json.dumps({"type": "content_block_stop", "index": block_index}),
+            }
+            block_index += 1
+
+        yield {
+            "event": "message_delta",
+            "data": json.dumps({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": raw_response.get("stop_reason", "end_turn"),
+                    "stop_sequence": raw_response.get("stop_sequence"),
+                },
+                "usage": {"output_tokens": output_tokens},
+            }),
+        }
+        yield {
+            "event": "message_stop",
+            "data": json.dumps({"type": "message_stop"}),
+        }
+
+    return EventSourceResponse(event_generator(), media_type="text/event-stream")
+
+
 def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
     """Extract text from the last user message in Anthropic format."""
     for msg in reversed(messages):
@@ -2791,253 +2853,93 @@ def _extract_last_user_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
-@app.post("/v1/messages")
-async def anthropic_messages(
-    raw_request: Request,
-    current_user: UserSession = Depends(validate_local_auth),
-):
-    """Anthropic Messages API compatibility endpoint.
+# ---------------------------------------------------------------------------
+# Direct Anthropic API call (bypass LiteLLM format conversion)
+# ---------------------------------------------------------------------------
 
-    Uses fake streaming: wait for complete response, then emit SSE events.
-    All claude-* models are treated as "auto" for smart routing.
+_ANTHROPIC_COMPAT_PROVIDERS = {
+    "zai": ("ZAI_API_BASE", "ZAI_API_KEY"),
+    "kimi": ("KIMI_API_BASE", "KIMI_API_KEY"),
+    "minimax": ("MINIMAX_API_BASE", "MINIMAX_API_KEY"),
+    "anthropic": ("ANTHROPIC_API_BASE", "ANTHROPIC_API_KEY"),
+}
+
+
+def _get_anthropic_compat_endpoint(provider: str):
+    """Return (api_base, api_key) if provider has an Anthropic-compatible endpoint."""
+    if provider not in _ANTHROPIC_COMPAT_PROVIDERS:
+        return None
+    base_env, key_env = _ANTHROPIC_COMPAT_PROVIDERS[provider]
+    api_base = os.getenv(base_env, "")
+    api_key = os.getenv(key_env, "")
+    if not api_base or not api_key:
+        return None
+    return api_base.rstrip("/"), api_key
+
+
+def _sanitize_anthropic_messages(messages: list) -> list:
+    """Sanitize Anthropic messages for compatible endpoints.
+
+    Fixes known provider quirks:
+    - ZAI requires 'id' on tool_result blocks (non-standard)
+    - MiniMax requires tool_use.input to be a dict
     """
-    start_time = time.time()
-    request_id = str(uuid.uuid4())
+    import copy
+    msgs = copy.deepcopy(messages)
+    for msg in msgs:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            # ZAI bug: tool_result needs an 'id' field
+            if block.get("type") == "tool_result" and "id" not in block:
+                block["id"] = f"toolr_{block.get('tool_use_id', 'unknown')}"
+            # Ensure tool_use.input is a dict
+            if block.get("type") == "tool_use":
+                inp = block.get("input")
+                if not isinstance(inp, dict):
+                    block["input"] = {"value": inp} if inp is not None else {}
+    return msgs
 
-    try:
-        body = await raw_request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    ant_model = body.get("model", "")
-    if ant_model.startswith("claude-"):
-        ant_model = "auto"
-    ant_messages = body.get("messages", [])
-    ant_system = body.get("system")
-    ant_max_tokens = body.get("max_tokens", 4096)
-    ant_stream = body.get("stream", False)
-    ant_tools = body.get("tools", [])
+async def _call_anthropic_direct(api_base: str, api_key: str, model: str,
+                                  body: dict, timeout: float = 600.0) -> dict:
+    """Call Anthropic-compatible endpoint directly, no format conversion."""
+    import httpx
+    url = f"{api_base}/v1/messages"
 
-    prompt_text = _extract_conversation_snippet_from_dicts(ant_messages)
+    ant_body = {"model": model, "max_tokens": body.get("max_tokens", 4096)}
+    for key in ("system", "tools", "tool_choice", "thinking",
+                "temperature", "top_p", "stop_sequences", "metadata"):
+        if key in body and body[key]:
+            ant_body[key] = body[key]
+    # Sanitize messages for provider quirks
+    if "messages" in body:
+        ant_body["messages"] = _sanitize_anthropic_messages(body["messages"])
 
-    # Convert to internal OpenAI format
-    openai_messages = _anthropic_to_openai_messages(ant_messages, ant_system)
-    openai_tools = _anthropic_tools_to_openai(ant_tools) if ant_tools else []
-
-    # Build ChatCompletionRequest
-    req_data: Dict[str, Any] = {
-        "messages": [
-            {"role": m.role, "content": m.content, **(m.model_extra or {})}
-            for m in openai_messages
-        ],
-        "model": ant_model,
-        "max_tokens": ant_max_tokens,
-        "stream": False,
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
     }
-    if openai_tools:
-        req_data["tools"] = openai_tools
+    logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
 
-    request = ChatCompletionRequest(**req_data)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, headers=headers, json=ant_body)
 
-    # --- Rate limiting ---
-    retry_after = _rate_limiter.check(current_user.id)
-    if retry_after is not None:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded. Retry after {retry_after}s.",
-            headers={"Retry-After": str(retry_after)},
+    if resp.status_code >= 400:
+        error_text = resp.text[:500]
+        logger.warning("Direct Anthropic call failed (%s): %s", resp.status_code, error_text)
+        from litellm.exceptions import (
+            BadRequestError, AuthenticationError,
+            RateLimitError, InternalServerError,
         )
+        exc_map = {400: BadRequestError, 401: AuthenticationError,
+                   429: RateLimitError}
+        exc_cls = exc_map.get(resp.status_code, InternalServerError)
+        raise exc_cls(message=error_text, model=model, llm_provider="anthropic")
 
-    try:
-        req_meta = _extract_request_metadata(request)
+    return resp.json()
 
-        from nadirclaw.routing import (
-            apply_routing_modifiers,
-            get_session_cache,
-            resolve_alias,
-            resolve_profile,
-        )
-
-        profile = resolve_profile(request.model)
-
-        if profile == "eco":
-            selected_model = settings.SIMPLE_MODEL
-            analysis_info = {
-                "strategy": "profile:eco", "selected_model": selected_model,
-                "tier": "simple", "confidence": 1.0, "complexity_score": 0,
-            }
-        elif profile == "premium":
-            selected_model = settings.COMPLEX_MODEL
-            analysis_info = {
-                "strategy": "profile:premium", "selected_model": selected_model,
-                "tier": "complex", "confidence": 1.0, "complexity_score": 0,
-            }
-        elif profile == "free":
-            selected_model = settings.FREE_MODEL
-            analysis_info = {
-                "strategy": "profile:free", "selected_model": selected_model,
-                "tier": "free", "confidence": 1.0, "complexity_score": 0,
-            }
-        elif profile == "reasoning":
-            selected_model = settings.REASONING_MODEL
-            analysis_info = {
-                "strategy": "profile:reasoning", "selected_model": selected_model,
-                "tier": "reasoning", "confidence": 1.0, "complexity_score": 0,
-            }
-        elif request.model and request.model != "auto" and profile is None:
-            resolved = resolve_alias(request.model)
-            if resolved:
-                selected_model = resolved
-                analysis_info = {
-                    "strategy": "alias", "selected_model": selected_model,
-                    "alias_from": request.model, "tier": "direct",
-                    "confidence": 1.0, "complexity_score": 0,
-                }
-            else:
-                selected_model = request.model
-                analysis_info = {
-                    "strategy": "direct", "selected_model": selected_model,
-                    "tier": "direct", "confidence": 1.0, "complexity_score": 0,
-                }
-        else:
-            session_cache = get_session_cache()
-            cached = session_cache.get(request.messages)
-            if cached:
-                cached_model, cached_tier = cached
-                selected_model = cached_model
-                analysis_info = {
-                    "strategy": "session-cache", "selected_model": selected_model,
-                    "tier": cached_tier, "confidence": 1.0, "complexity_score": 0,
-                }
-                selected_model, final_tier, routing_info = apply_routing_modifiers(
-                    base_model=selected_model, base_tier=cached_tier,
-                    request_meta=req_meta, messages=request.messages,
-                    simple_model=settings.SIMPLE_MODEL, complex_model=settings.COMPLEX_MODEL,
-                    reasoning_model=settings.REASONING_MODEL, free_model=settings.FREE_MODEL,
-                )
-                if final_tier != cached_tier:
-                    analysis_info["tier"] = final_tier
-                    analysis_info["selected_model"] = selected_model
-                    analysis_info["routing_modifiers"] = routing_info
-            else:
-                selected_model, analysis_info = await _smart_route_full(
-                    request.messages, current_user
-                )
-                selected_model, final_tier, routing_info = apply_routing_modifiers(
-                    base_model=selected_model,
-                    base_tier=analysis_info.get("tier", "simple"),
-                    request_meta=req_meta, messages=request.messages,
-                    simple_model=settings.SIMPLE_MODEL, complex_model=settings.COMPLEX_MODEL,
-                    reasoning_model=settings.REASONING_MODEL, free_model=settings.FREE_MODEL,
-                )
-                analysis_info["tier"] = final_tier
-                analysis_info["selected_model"] = selected_model
-                analysis_info["routing_modifiers"] = routing_info
-                session_cache.put(request.messages, selected_model, final_tier)
-
-        # Model pool selection for /v1/messages — skip for explicit model
-        _pool_tier = analysis_info.get("tier", "")
-        _ant_model = body.get("model", "auto")
-        _is_explicit_model = _ant_model and _ant_model not in ("auto", "eco", "premium", "free", "reasoning")
-        if not _is_explicit_model and _pool_tier not in ("sonnet", "reasoning", "reasoning_sonnet", "review", "long_context"):
-            from nadirclaw.routing import get_pool_for_model, select_from_pool
-            pool_name = get_pool_for_model(selected_model)
-            if pool_name:
-                pool_model = select_from_pool(pool_name)
-                if pool_model:
-                    logger.info("Pool %s: %s → %s", pool_name, selected_model, pool_model)
-                    selected_model = pool_model
-
-        # Context compression for /v1/messages
-        if getattr(settings, 'CONTEXT_COMPRESSION', 'false').lower() in ('true', '1', 'yes'):
-            from nadirclaw.compress import compress_messages
-            if len(request.messages) > 30:
-                msg_dicts = []
-                for m in request.messages:
-                    d = {"role": m.role, "content": m.content}
-                    extra = m.model_extra or {}
-                    if "tool_calls" in extra:
-                        d["tool_calls"] = extra["tool_calls"]
-                    if "tool_call_id" in extra:
-                        d["tool_call_id"] = extra["tool_call_id"]
-                    if "name" in extra:
-                        d["name"] = extra["name"]
-                    msg_dicts.append(d)
-                compressed, comp_stats = compress_messages(msg_dicts)
-                if not comp_stats.get("skipped"):
-                    logger.info("Context compression: %d→%d msgs, ratio=%.2f",
-                               comp_stats["messages_before"], comp_stats["messages_after"],
-                               comp_stats["compression_ratio"])
-                    new_msgs = []
-                    for d in compressed:
-                        extras = {}
-                        if "tool_calls" in d:
-                            extras["tool_calls"] = d["tool_calls"]
-                        if "tool_call_id" in d:
-                            extras["tool_call_id"] = d["tool_call_id"]
-                        if "name" in d:
-                            extras["name"] = d["name"]
-                        cm = ChatMessage(role=d["role"], content=d.get("content"), **extras)
-                        new_msgs.append(cm)
-                    request.messages = new_msgs
-
-        from nadirclaw.credentials import detect_provider
-        provider = detect_provider(selected_model)
-
-        from nadirclaw.telemetry import record_llm_call, trace_span
-
-        with trace_span("anthropic_messages", {"nadirclaw.tier": analysis_info.get("tier")}) as span:
-            response_data, selected_model, analysis_info = await _call_with_fallback(
-                selected_model, request, provider, analysis_info,
-            )
-            elapsed_ms = int((time.time() - start_time) * 1000)
-
-            record_llm_call(
-                span, model=selected_model, provider=provider,
-                prompt_tokens=response_data.get("prompt_tokens", 0),
-                completion_tokens=response_data.get("completion_tokens", 0),
-                tier=analysis_info.get("tier"), latency_ms=elapsed_ms,
-            )
-
-        # Log
-        _log_request({
-            "type": "anthropic_messages",
-            "request_id": request_id,
-            "prompt": prompt_text[:200],
-            "selected_model": selected_model,
-            "tier": analysis_info.get("tier"),
-            "fallback_used": analysis_info.get("fallback_from"),
-            "total_latency_ms": elapsed_ms,
-            "prompt_tokens": response_data.get("prompt_tokens", 0),
-            "completion_tokens": response_data.get("completion_tokens", 0),
-            "status": "ok",
-            **req_meta,
-        })
-
-        # Return in Anthropic format — use client's original model name
-        display_model = body.get("model", "") or selected_model
-
-        if ant_stream:
-            return _build_anthropic_streaming_response(request_id, display_model, response_data)
-
-        return JSONResponse(
-            content=_openai_response_to_anthropic(response_data, display_model, request_id),
-            headers={"content-type": "application/json"},
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        elapsed_ms = int((time.time() - start_time) * 1000)
-        logger.error("Anthropic messages error: %s", e, exc_info=True)
-        _log_request({
-            "type": "anthropic_messages",
-            "request_id": request_id,
-            "status": "error",
-            "error": str(e),
-            "total_latency_ms": elapsed_ms,
-        })
-        raise HTTPException(
-            status_code=500,
-            detail=f"Internal error. Request ID: {request_id}",
-        )
