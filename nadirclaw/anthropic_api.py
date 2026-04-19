@@ -450,6 +450,93 @@ def _build_anthropic_streaming_response(
     return EventSourceResponse(event_generator(), media_type="text/event-stream")
 
 
+def build_anthropic_sse_events(
+    request_id: str,
+    model: str,
+    response_data: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Build Anthropic SSE event list from a completed OpenAI-format response.
+
+    Public helper for testing and diagnostics. Returns a list of
+    ``{"event": ..., "data": ...}`` dicts following Anthropic's SSE protocol.
+    """
+    content = response_data.get("content", "") or ""
+    tool_calls = response_data.get("tool_calls", [])
+    input_tokens = response_data.get("prompt_tokens", 0)
+    output_tokens = response_data.get("completion_tokens", 0)
+    finish = response_data.get("finish_reason", "stop")
+
+    stop_reason = (
+        "tool_use" if finish == "tool_calls"
+        else ("max_tokens" if finish == "length" else "end_turn")
+    )
+    msg_id = f"msg_{request_id}"
+    events: List[Dict[str, str]] = []
+
+    events.append({
+        "event": "message_start",
+        "data": json.dumps({
+            "type": "message_start",
+            "message": {
+                "id": msg_id, "type": "message", "role": "assistant",
+                "model": model, "content": [], "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        }),
+    })
+
+    block_idx = 0
+
+    if content:
+        events.append({"event": "content_block_start", "data": json.dumps({
+            "type": "content_block_start", "index": block_idx,
+            "content_block": {"type": "text", "text": ""},
+        })})
+        events.append({"event": "content_block_delta", "data": json.dumps({
+            "type": "content_block_delta", "index": block_idx,
+            "delta": {"type": "text_delta", "text": content},
+        })})
+        events.append({"event": "content_block_stop", "data": json.dumps({
+            "type": "content_block_stop", "index": block_idx,
+        })})
+        block_idx += 1
+
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        try:
+            input_data = json.loads(func.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            input_data = {}
+
+        events.append({"event": "content_block_start", "data": json.dumps({
+            "type": "content_block_start", "index": block_idx,
+            "content_block": {
+                "type": "tool_use", "id": tc.get("id", str(uuid.uuid4())),
+                "name": func.get("name", ""), "input": {},
+            },
+        })})
+        events.append({"event": "content_block_delta", "data": json.dumps({
+            "type": "content_block_delta", "index": block_idx,
+            "delta": {"type": "input_json_delta", "partial_json": json.dumps(input_data)},
+        })})
+        events.append({"event": "content_block_stop", "data": json.dumps({
+            "type": "content_block_stop", "index": block_idx,
+        })})
+        block_idx += 1
+
+    events.append({"event": "message_delta", "data": json.dumps({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": output_tokens},
+    })})
+    events.append({"event": "message_stop", "data": json.dumps({
+        "type": "message_stop",
+    })})
+
+    return events
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
