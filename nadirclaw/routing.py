@@ -396,8 +396,9 @@ _REASONING_MARKERS = re.compile(
 # Patterns that indicate auto-injected context (not real user requests)
 _CONTEXT_INJECTION_PATTERNS = re.compile(
     r"(?i)("
+    # CLAUDE.md / config injection by Claude Code
     r"the following (is|are) the user'?s?\s*(claude\.md|claudemd|gemini\.md|agents\.md)"
-    r"|contents of .*claude\.md"
+    r"|contents of .*(claude\.md|settings\.json)"
     r"|project instructions.*checked into"
     r"|user'?s?\s*private global instructions"
     r"|codebase and user instructions"
@@ -631,13 +632,15 @@ def detect_complex_coding(
         confidence += settings.COMPLEX_WEIGHT_COMBO * 0.5  # 0.15 by default
         signals.append("read_edit_combo")
 
-    # Signal 3: Deep conversation (long conversations = complex tasks)
-    if message_count >= 20:
+    # Signal 3: Recent tool call density (last 2 assistant turns)
+    # High density = actively working on a complex task
+    recent_tool_count = sum(actual_tool_calls.values())
+    if recent_tool_count >= 8:
         confidence += settings.COMPLEX_WEIGHT_CONVERSATION
-        signals.append(f"deep_conversation({message_count})")
-    elif message_count >= 10:
-        confidence += settings.COMPLEX_WEIGHT_CONVERSATION * 0.5  # 0.10 by default
-        signals.append(f"moderate_conversation({message_count})")
+        signals.append(f"high_tool_density({recent_tool_count})")
+    elif recent_tool_count >= 4:
+        confidence += settings.COMPLEX_WEIGHT_CONVERSATION * 0.5
+        signals.append(f"moderate_tool_density({recent_tool_count})")
 
     # Signal 4: Skip large system prompt signal — always true for Claude Code
     # (was: system_prompt_length > 15000 → +0.10, but meaningless for main session)
@@ -1129,6 +1132,26 @@ def apply_routing_modifiers(
         last_user_message=last_user_text_for_role,
     )
     routing_info["claude_code_role"] = cc_role
+
+    # --- Background security monitor detection (early return) ---
+    # These are PreToolUse hook requests (action-guard) that check if agent
+    # actions are safe. They are binary classification (allow/block) and
+    # should use cheap models, not sonnet/opus.
+    if "You are a security monitor for autonomous AI coding agents" in system_text:
+        target = simple_model or free_model or base_model
+        routing_info["modifiers_applied"].append("security_monitor_downgrade")
+        logger.debug("Security monitor detected → %s", target)
+        return target, "simple", routing_info
+
+    # --- CLAUDE.md / config injection detection (early return) ---
+    # These are background context injections, not user requests.
+    # Route to execution tier (cheap model) instead of complex/reasoning.
+    last_user_for_injection = all_user_texts_for_role[-1] if all_user_texts_for_role else ""
+    if _CONTEXT_INJECTION_PATTERNS.search(last_user_for_injection[:500]):
+        target = request_meta.get("execution_model") or simple_model or free_model or base_model
+        routing_info["modifiers_applied"].append("context_injection_downgrade")
+        logger.debug("CLAUDE.md injection detected → %s (execution)", target)
+        return target, "execution", routing_info
 
     # --- Agentic detection ---
     agentic = detect_agentic(
