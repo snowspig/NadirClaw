@@ -11,6 +11,7 @@ import random
 import re
 import time
 from collections import OrderedDict
+from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,7 +25,7 @@ def _parse_model_pools() -> Dict[str, List[Tuple[str, int]]]:
     """Parse NADIRCLAW_MODEL_POOLS env var into pool configuration.
 
     Format: "pool_name=model1,weight1+model2,weight2;pool_name2=..."
-    Example: "turbo=gemini-2.5-flash,10+gpt-4.1-nano,5;reasoning=gpt-5.2,8+claude-opus-4-6-20250918,4"
+    Example: "turbo=glm-5-turbo,10+kimi-K2.6-code-preview,9+minimax-MiniMax-M2.7,3"
     """
     raw = os.getenv("NADIRCLAW_MODEL_POOLS", "")
     if not raw:
@@ -60,25 +61,29 @@ def _parse_model_pools() -> Dict[str, List[Tuple[str, int]]]:
     return pools
 
 
-MODEL_POOLS: Dict[str, List[Tuple[str, int]]] = _parse_model_pools()
+_MODEL_POOLS_CACHE: Optional[Dict[str, List[Tuple[str, int]]]] = None
+_MODEL_TO_POOL_CACHE: Optional[Dict[str, str]] = None
 
-# Reverse map: model name → pool name
-_MODEL_TO_POOL: Dict[str, str] = {}
-for _pool_name, _models in MODEL_POOLS.items():
-    for _model_name, _ in _models:
-        _MODEL_TO_POOL[_model_name] = _pool_name
+
+def _ensure_pools_loaded() -> None:
+    global _MODEL_POOLS_CACHE, _MODEL_TO_POOL_CACHE
+    if _MODEL_POOLS_CACHE is not None:
+        return
+    _env_file = Path.home() / ".nadirclaw" / ".env"
+    if _env_file.exists():
+        from dotenv import load_dotenv
+        load_dotenv(_env_file, override=False)
+    _MODEL_POOLS_CACHE = _parse_model_pools()
+    _MODEL_TO_POOL_CACHE = {}
+    for pool_name, models in _MODEL_POOLS_CACHE.items():
+        for model_name, _ in models:
+            _MODEL_TO_POOL_CACHE[model_name] = pool_name
 
 
 def select_from_pool(pool_name: str) -> str:
-    """Select a model from the pool using weighted random selection.
-
-    Args:
-        pool_name: Name of the pool (e.g., "turbo", "reasoning").
-
-    Returns:
-        Selected model name, or the first model in the pool as fallback.
-    """
-    pool = MODEL_POOLS.get(pool_name)
+    """Select a model from the pool using weighted random selection."""
+    _ensure_pools_loaded()
+    pool = _MODEL_POOLS_CACHE.get(pool_name)
     if not pool:
         logger.warning("Unknown model pool: %s", pool_name)
         return ""
@@ -99,7 +104,9 @@ def select_from_pool(pool_name: str) -> str:
 
 def get_pool_for_model(model: str) -> Optional[str]:
     """Return the pool name for a given model, or None if not in any pool."""
-    return _MODEL_TO_POOL.get(model)
+    _ensure_pools_loaded()
+    return _MODEL_TO_POOL_CACHE.get(model)
+
 
 # ---------------------------------------------------------------------------
 # Model registry — context windows and capabilities
@@ -113,22 +120,22 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "gemini/gemini-3-flash-preview": {"context_window": 1_000_000, "cost_per_m_input": 0.50, "cost_per_m_output": 3.00, "has_vision": True},
     "gemini/gemini-2.5-pro": {"context_window": 1_000_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
     # OpenAI
-    "gpt-4.1": {"context_window": 1_047_576, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
-    "gpt-4.1-mini": {"context_window": 1_047_576, "cost_per_m_input": 0.40, "cost_per_m_output": 1.60, "has_vision": True},
-    "gpt-4.1-nano": {"context_window": 1_047_576, "cost_per_m_input": 0.10, "cost_per_m_output": 0.40, "has_vision": True},
+    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
+    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 0.40, "cost_per_m_output": 1.60, "has_vision": True},
+    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 0.10, "cost_per_m_output": 0.40, "has_vision": True},
     "gpt-5": {"context_window": 400_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
     "gpt-5-mini": {"context_window": 400_000, "cost_per_m_input": 0.25, "cost_per_m_output": 2.00, "has_vision": True},
     "gpt-5.1": {"context_window": 400_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
     "gpt-5.2": {"context_window": 400_000, "cost_per_m_input": 1.75, "cost_per_m_output": 14.00, "has_vision": True},
-    "gpt-4o": {"context_window": 128_000, "cost_per_m_input": 2.50, "cost_per_m_output": 10.00, "has_vision": True},
-    "gpt-4o-mini": {"context_window": 128_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": True},
+    "gpt-5.4": {"context_window": 128_000, "cost_per_m_input": 2.50, "cost_per_m_output": 10.00, "has_vision": True},
+    "gpt-5.4": {"context_window": 128_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": True},
     "o3": {"context_window": 200_000, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
     "o3-mini": {"context_window": 200_000, "cost_per_m_input": 1.10, "cost_per_m_output": 4.40, "has_vision": True},
     "o4-mini": {"context_window": 200_000, "cost_per_m_input": 1.10, "cost_per_m_output": 4.40, "has_vision": True},
     "openai-codex/gpt-5.3-codex": {"context_window": 400_000, "cost_per_m_input": 1.75, "cost_per_m_output": 14.00, "has_vision": False},
     # Anthropic
     "claude-opus-4-6-20250918": {"context_window": 200_000, "cost_per_m_input": 5.00, "cost_per_m_output": 25.00, "has_vision": True},
-    "claude-sonnet-4-5-20250929": {"context_window": 200_000, "cost_per_m_input": 3.00, "cost_per_m_output": 15.00, "has_vision": True},
+    "claude-sonnet-4-6": {"context_window": 200_000, "cost_per_m_input": 3.00, "cost_per_m_output": 15.00, "has_vision": True},
     "claude-haiku-4-5-20251001": {"context_window": 200_000, "cost_per_m_input": 1.00, "cost_per_m_output": 5.00, "has_vision": True},
     "claude-opus-4-20250514": {"context_window": 200_000, "cost_per_m_input": 5.00, "cost_per_m_output": 25.00, "has_vision": True},
     "claude-sonnet-4-20250514": {"context_window": 200_000, "cost_per_m_input": 3.00, "cost_per_m_output": 15.00, "has_vision": True},
@@ -139,6 +146,20 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     # Ollama (local, no cost, context varies by model)
     "ollama/llama3.1:8b": {"context_window": 128_000, "cost_per_m_input": 0, "cost_per_m_output": 0, "has_vision": False},
     "ollama/qwen3:32b": {"context_window": 128_000, "cost_per_m_input": 0, "cost_per_m_output": 0, "has_vision": False},
+    # GLM (Zhipu AI)
+    "glm-5": {"context_window": 200_000, "cost_per_m_input": 0.05, "cost_per_m_output": 0.05, "has_vision": False},
+    "glm-5.1": {"context_window": 200_000, "cost_per_m_input": 0.05, "cost_per_m_output": 0.05, "has_vision": False},
+    "glm-5-turbo": {"context_window": 200_000, "cost_per_m_input": 0.05, "cost_per_m_output": 0.05, "has_vision": False},
+    "glm-4.7": {"context_window": 200_000, "cost_per_m_input": 0.05, "cost_per_m_output": 0.05, "has_vision": False},
+    "glm-4.7-flash": {"context_window": 200_000, "cost_per_m_input": 0.01, "cost_per_m_output": 0.01, "has_vision": False},
+    "zai/glm-5": {"context_window": 200_000, "cost_per_m_input": 0.05, "cost_per_m_output": 0.05, "has_vision": False},
+    # MiniMax
+    "minimax-MiniMax-M2.7": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
+    "minimax-MiniMax-M2.5": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
+    # Kimi
+    "kimi-K2.6-code-preview": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
+    # Gemini 3.1 Pro (long context)
+    "gemini-3.1-pro": {"context_window": 2_000_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
 }
 
 # ---------------------------------------------------------------------------
@@ -146,13 +167,15 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 MODEL_ALIASES: Dict[str, str] = {
-    "sonnet": "claude-sonnet-4-5-20250929",
-    "opus": "claude-opus-4-6-20250918",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-6",
     "haiku": "claude-haiku-4-5-20251001",
-    "claude": "claude-sonnet-4-5-20250929",
-    "gpt4": "gpt-4.1",
-    "gpt4o": "gpt-4o",
-    "gpt4-mini": "gpt-4.1-mini",
+    "claude": "claude-sonnet-4-6",
+    "claude-opus-4-6": "claude-opus-4-6-20250918",
+    "claude-sonnet-4-6": "claude-sonnet-4-6",
+    "gpt-5.4": "gpt-5.4",
+    "gpt5.4": "gpt-5.4",
+    "gpt-5.4": "gpt-5.4",
     "gpt5": "gpt-5.2",
     "gpt5-mini": "gpt-5-mini",
     "o3": "o3",
@@ -164,6 +187,10 @@ MODEL_ALIASES: Dict[str, str] = {
     "deepseek": "deepseek/deepseek-chat",
     "deepseek-r1": "deepseek/deepseek-reasoner",
     "llama": "ollama/llama3.1:8b",
+    "glm": "glm-5",
+    "glm5": "glm-5",
+    "minimax": "minimax-MiniMax-M2.7",
+    "kimi": "kimi-K2.6-code-preview",
 }
 
 # ---------------------------------------------------------------------------
@@ -231,51 +258,64 @@ def detect_agentic(
     """Score agentic signals in a request.
 
     Returns {"is_agentic": bool, "confidence": float, "signals": list[str]}.
+
+    NOTE: Threshold raised to 0.80 to avoid false positives from Claude Code's
+    default tool-rich environment (200+ tools, 15KB+ system prompt).
     """
     score = 0.0
     signals: List[str] = []
 
-    # Tool definitions present
-    if has_tools and tool_count >= 1:
-        score += 0.35
-        signals.append(f"tools_defined({tool_count})")
-    if tool_count >= 4:
-        score += 0.15
-        signals.append("many_tools")
+    # Tool definitions present - DISABLED for Claude Code (always 200+ tools)
+    # if has_tools and tool_count >= 1:
+    #     score += 0.35
+    #     signals.append(f"tools_defined({tool_count})")
+    # if tool_count >= 4:
+    #     score += 0.15
+    #     signals.append("many_tools")
 
     # Tool-role messages in conversation (active agentic loop)
+    # Higher threshold for Claude Code: need 3+ tool messages for strong signal
     tool_msgs = sum(1 for m in messages if getattr(m, "role", None) == "tool")
-    if tool_msgs >= 1:
+    if tool_msgs >= 3:
+        score += 0.60
+        signals.append(f"tool_messages({tool_msgs})")
+    elif tool_msgs >= 1:
         score += 0.30
         signals.append(f"tool_messages({tool_msgs})")
 
     # Assistant→tool cycles (multi-step execution)
+    # Higher threshold: need 3+ cycles for strong signal
     cycles = _count_agentic_cycles(messages)
-    if cycles >= 2:
-        score += 0.20
+    if cycles >= 3:
+        score += 0.50
         signals.append(f"agentic_cycles({cycles})")
-    elif cycles == 1:
-        score += 0.10
-        signals.append("single_cycle")
+    elif cycles >= 2:
+        score += 0.30
+        signals.append(f"agentic_cycles({cycles})")
 
-    # Long system prompt (agents have verbose instructions)
-    if system_prompt_length > 500:
-        score += 0.10
-        signals.append("long_system_prompt")
+    # Long system prompt - DISABLED for Claude Code (always 15KB+)
+    # if system_prompt_length > 500:
+    #     score += 0.10
+    #     signals.append("long_system_prompt")
 
-    # System prompt keywords
-    if system_prompt and _AGENTIC_SYSTEM_KEYWORDS.search(system_prompt):
-        score += 0.20
-        signals.append("agentic_keywords")
+    # System prompt keywords - DISABLED for Claude Code (always present)
+    # if system_prompt and _AGENTIC_SYSTEM_KEYWORDS.search(system_prompt):
+    #     score += 0.20
+    #     signals.append("agentic_keywords")
 
     # Many messages (deep conversation / multi-turn loop)
-    if message_count > 10:
+    # Higher thresholds for Claude Code's longer sessions
+    if message_count > 50:
+        score += 0.20
+        signals.append("deep_conversation(50+)")
+    elif message_count > 20:
         score += 0.10
-        signals.append("deep_conversation")
+        signals.append("deep_conversation(20+)")
 
     # Cap at 1.0
     confidence = min(score, 1.0)
-    is_agentic = confidence >= 0.35
+    # Raised threshold from 0.35 to 0.80 for Claude Code compatibility
+    is_agentic = confidence >= 0.80
 
     return {"is_agentic": is_agentic, "confidence": confidence, "signals": signals}
 
@@ -299,44 +339,56 @@ def _count_agentic_cycles(messages: List[Any]) -> int:
 # ---------------------------------------------------------------------------
 
 _REASONING_MARKERS = re.compile(
-    r"("
-    # English markers
-    r"step[- ]by[- ]step"
-    r"|think (?:through|carefully|deeply|about)"
-    r"|chain[- ]of[- ]thought"
-    r"|let'?s? reason"
-    r"|reason(?:ing)? (?:about|through)"
-    r"|prove (?:that|this|the)"
-    r"|formal (?:proof|verification)"
-    r"|mathematical(?:ly)? (?:prove|show|derive)"
-    r"|derive (?:the|a|an)"
-    r"|analyze the (?:tradeoffs?|trade-offs?|implications?|consequences?)"
-    r"|compare and contrast"
-    r"|what are the (?:pros? and cons?|advantages? and disadvantages?)"
-    r"|evaluate (?:the|whether|if)"
-    r"|critically (?:analyze|assess|examine)"
-    r"|explain (?:why|how|the reasoning)"
-    r"|work through"
-    r"|break (?:this|it) down"
-    r"|logical(?:ly)? (?:deduce|infer|conclude)"
-    r"|analyze why (?:this|the|it)"
-    r"|diagnose the (?:root )?cause"
-    r"|weigh (?:the )?(?:pros|cons|options|alternatives)"
-    r"|architectural (?:decision|choice)"
-    r"|design (?:a )?(?:system|architecture)"
-    # Chinese markers
+    r"("  # No start boundary check for Chinese support
+    # English markers (stronger indicators)
+    r"step\s*by\s*step"  # Allow "step by step" or "step-by-step"
+    r"|chain\s*of\s*thought"
+    r"|let'?s?\s+reason\s+about"
+    r"|reasoning\s+(?:task|problem|question)"
+    r"|prove\s+(?:that|this|the)\s+(?:by|using|with)"
+    r"|formal\s+(?:proof|verification)"
+    r"|mathematical(?:ly)?\s+(?:prove|show|derive)"
+    r"|derive\s+(?:the|a|an)\s+(?:formula|equation|result)"
+    r"|analyze\s+the\s+(?:tradeoffs?|trade-offs?|implications?|consequences?)"
+    r"|compare\s+and\s+contrast"
+    r"|pros?\s+and\s+cons?"
+    r"|advantages?\s+and\s+disadvantages?"
+    r"|tradeoffs?"
+    r"|trade-offs?"
+    r"|critically\s+(?:analyze|assess|examine)"
+    r"|explain\s+(?:the\s+)?reasoning"
+    r"|break\s+(?:this|it)\s+down\s+step"
+    r"|logical(?:ly)?\s+(?:deduce|infer|conclude)"
+    r"|analyze\s+why\s+(?:this|the|it)"
+    r"|diagnose\s+the\s+(?:root\s+)?cause"
+    r"|weigh\s+(?:the\s+)?(?:pros|cons|options|alternatives)"
+    r"|evaluate\s+(?:the\s+)?(?:options|alternatives|tradeoffs)"
+    r"|design\s+(?:a\s+)?(?:system|architecture)\s+(?:that|with)"
+    r"|architectural\s+(?:decision|choice)"
+    # Chinese markers (中文推理标记词) - strong indicators
     r"|一步步"
     r"|逐步分析"
     r"|深入思考"
     r"|深入分析"
     r"|推理分析"
     r"|逻辑推理"
-    r"|优缺点"
-    r"|对比分析"
-    r"|权衡.*优劣"
+    r"|证明\s+(?:以下|这个)"
+    r"|推导\s+(?:公式|结论)"
     r"|分析.*利弊"
+    r"|权衡.*优劣"
+    r"|权衡.*利弊"
+    r"|对比分析"
+    r"|比较.*差异"
+    r"|优缺点"
     r"|批判性分析"
-    r")",
+    r"|详细解释.*原因"
+    r"|阐述.*原因"
+    r"|论证\s+(?:以下|这个)"
+    r"|演绎\s+(?:推理|证明)"
+    r"|归纳\s+(?:推理|总结)"
+    r"|设计.*系统.*(?:要求|支持)"
+    r"|设计一个.*(?:架构|方案)"
+    r")",  # No boundary check for Chinese support
     re.IGNORECASE,
 )
 
@@ -345,13 +397,17 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     """Detect if a prompt requires reasoning capabilities.
 
     Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
+
+    NOTE: Only checks the user prompt, NOT the system message.
+    System messages in Claude Code contain many reasoning-related instructions
+    that would cause false positives for every request.
     """
-    combined = f"{system_message} {prompt}"
-    matches = _REASONING_MARKERS.findall(combined)
+    # Only check user prompt, ignore system_message to avoid false positives
+    matches = _REASONING_MARKERS.findall(prompt)
     marker_count = len(matches)
 
-    # 2+ markers = high confidence reasoning (like ClawRouter)
-    is_reasoning = marker_count >= 2
+    # 1+ markers = reasoning task
+    is_reasoning = marker_count >= 1
 
     return {
         "is_reasoning": is_reasoning,
@@ -361,10 +417,321 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Agent role detection — identify AI coding agent session types
+# Execution task detection
 # ---------------------------------------------------------------------------
 
-_PLANNING_MARKERS = re.compile(
+_EXECUTION_MARKERS = re.compile(
+    r"\b("
+    r"run\s+(tests?|the|this|build|lint|check|script)"
+    r"|execute\s+(this|the|command|script)"
+    r"|bash\s+"
+    r"|shell\s+"
+    r"|git\s+(commit|push|pull|add|status|checkout|merge|rebase|branch)"
+    r"|npm\s+(install|run|test|build|start)"
+    r"|pip\s+install"
+    r"|docker\s+(build|run|push|pull|exec)"
+    r"|kubectl\s+"
+    r"|compile\s+(this|the|code)"
+    r"|lint\s+(this|the|code|check)"
+    r"|build\s+(this|the|project)"
+    r"|start\s+(the\s+)?(server|service|app)"
+    r"|stop\s+(the\s+)?(server|service|app)"
+    r"|restart\s+(the\s+)?(server|service|app)"
+    r"|deploy\s+(this|the|to)"
+    r"|cd\s+\S"
+    r"|mkdir\s+"
+    r"|rm\s+"
+    r"|cp\s+"
+    r"|mv\s+"
+    r"|ls\s*"
+    r"|cat\s+"
+    r"|grep\s+"
+    r"|find\s+"
+    r"|chmod\s+"
+    r"|chown\s+"
+    r"|apt\s+"
+    r"|yum\s+"
+    r"|brew\s+install"
+    r"|make\s+"
+    r"|cargo\s+"
+    r"|go\s+(run|build|test|mod)"
+    r"|python\s+"
+    r"|node\s+"
+    r"|pytest\s+"
+    r"|jest\s+"
+    r"|cargo\s+test"
+    r"|go\s+test"
+    r"|mvn\s+"
+    r"|gradle\s+"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CONTINUATION_MARKERS = re.compile(
+    r"^("
+    r"继续$"
+    r"|continue$"
+    r"|go\s*ahead$"
+    r"|执行$"
+    r"|proceed$"
+    r"|keep\s+going$"
+    r"|carry\s+on$"
+    r"|next$"
+    r"|下一步$"
+    r"|then\?$"
+    r"|and\s+then$"
+    r"|之后呢$"
+    r"|接着$"
+    r"|继续吧$"
+    r"|go\s+on$"
+    r")$",
+    re.IGNORECASE,
+)
+
+_EXECUTION_TOOLS = {
+    "Bash", "bash", "shell", "execute", "Execute", "exec", "Exec",
+    "Write", "write", "Edit", "edit", "FileEdit", "file_edit",
+    "Task", "task", "Run", "run", "Command", "command",
+    "NotebookEdit", "notebook_edit",
+}
+
+
+def detect_execution(
+    prompt: str,
+    tool_names: Optional[List[str]] = None,
+    last_tool_call: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Detect if a prompt is an execution/continuation task.
+
+    Returns {"is_execution": bool, "confidence": float, "signals": list[str]}.
+    """
+    score = 0.0
+    signals: List[str] = []
+
+    # Continuation prompts (very high confidence)
+    prompt_stripped = prompt.strip()
+    if _CONTINUATION_MARKERS.match(prompt_stripped):
+        score += 0.70
+        signals.append("continuation_prompt")
+
+    # Execution keywords in prompt
+    if _EXECUTION_MARKERS.search(prompt):
+        score += 0.40
+        signals.append("execution_keywords")
+
+    # Last tool call was an execution tool
+    if last_tool_call and last_tool_call in _EXECUTION_TOOLS:
+        score += 0.50
+        signals.append(f"last_tool={last_tool_call}")
+
+    # Request defines execution tools
+    if tool_names:
+        exec_tools = [t for t in tool_names if t in _EXECUTION_TOOLS]
+        if exec_tools:
+            score += 0.30
+            signals.append(f"tools={exec_tools[:3]}")
+
+    confidence = min(score, 1.0)
+    is_execution = confidence >= 0.40
+
+    return {"is_execution": is_execution, "confidence": confidence, "signals": signals}
+
+
+# ---------------------------------------------------------------------------
+# Complex coding detection
+# ---------------------------------------------------------------------------
+
+def detect_complex_coding(
+    messages: List[Any],
+    tool_names: List[str],
+    last_tool_call: Optional[str],
+    message_count: int,
+    system_prompt_length: int = 0,
+) -> Dict[str, Any]:
+    """Detect complex coding tasks that should route to Sonnet.
+
+    Complex coding tasks are characterized by:
+    - Multiple file edits (3+ Edit/Write calls)
+    - Tool combination patterns (Read + Edit + Bash)
+    - Deep conversations (10+ messages)
+    - Coding task keywords (implement, refactor, fix bug, etc.)
+
+    Returns {"is_complex": bool, "confidence": float, "signals": list}.
+    """
+    from nadirclaw.settings import settings
+
+    confidence = 0.0
+    signals: List[str] = []
+
+    # Count ACTUAL tool calls from RECENT messages only (last 6 assistant msgs)
+    # Long conversations accumulate many tool calls — only recent ones matter
+    actual_tool_calls: Dict[str, int] = {}
+    assistant_count = 0
+    for m in reversed(messages):
+        if getattr(m, "role", "") == "assistant":
+            assistant_count += 1
+            if assistant_count > 6:
+                break
+            content = getattr(m, "content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        name = block.get("name", "")
+                        actual_tool_calls[name] = actual_tool_calls.get(name, 0) + 1
+            # Also check model_extra for tool_calls (OpenAI format)
+            m_extra = getattr(m, "model_extra", None) or {}
+            for tc in m_extra.get("tool_calls", []):
+                if isinstance(tc, dict):
+                    func = tc.get("function", {})
+                    name = func.get("name", "") if isinstance(func, dict) else ""
+                    if name:
+                        actual_tool_calls[name] = actual_tool_calls.get(name, 0) + 1
+
+    # Signal 1: Heavy editing (multiple actual Edit/Write calls)
+    edit_write_count = sum(
+        actual_tool_calls.get(t, 0) for t in ["Edit", "Write", "NotebookEdit"]
+    )
+    if edit_write_count >= 5:
+        confidence += settings.COMPLEX_WEIGHT_EDITING
+        signals.append(f"heavy_editing({edit_write_count})")
+    elif edit_write_count >= 3:
+        confidence += settings.COMPLEX_WEIGHT_EDITING * 0.6  # 0.30 by default
+        signals.append(f"moderate_editing({edit_write_count})")
+
+    # Signal 2: Tool combination pattern (actual Read + Edit + Bash calls)
+    has_read = actual_tool_calls.get("Read", 0) > 0
+    has_edit = any(actual_tool_calls.get(t, 0) > 0 for t in ["Edit", "Write", "NotebookEdit"])
+    has_bash = actual_tool_calls.get("Bash", 0) > 0
+    if has_read and has_edit and has_bash:
+        confidence += settings.COMPLEX_WEIGHT_COMBO
+        signals.append("read_edit_bash_combo")
+    elif has_read and has_edit:
+        confidence += settings.COMPLEX_WEIGHT_COMBO * 0.5  # 0.15 by default
+        signals.append("read_edit_combo")
+
+    # Signal 3: Deep conversation (long conversations = complex tasks)
+    if message_count >= 20:
+        confidence += settings.COMPLEX_WEIGHT_CONVERSATION
+        signals.append(f"deep_conversation({message_count})")
+    elif message_count >= 10:
+        confidence += settings.COMPLEX_WEIGHT_CONVERSATION * 0.5  # 0.10 by default
+        signals.append(f"moderate_conversation({message_count})")
+
+    # Signal 4: Skip large system prompt signal — always true for Claude Code
+    # (was: system_prompt_length > 15000 → +0.10, but meaningless for main session)
+
+    # Signal 5: Coding task keywords in last user message
+    last_user_text = ""
+    for m in reversed(messages):
+        if getattr(m, "role", "") == "user":
+            last_user_text = getattr(m, "text_content", lambda: "")()
+            break
+
+    # Coding keywords (Chinese + English)
+    coding_keywords = [
+        # Implementation
+        r"实现", r"添加.*功能", r"implement", r"add.*feature",
+        # Modification
+        r"修改", r"更新", r"modify", r"update", r"change",
+        # Refactoring
+        r"重构", r"优化", r"refactor", r"optimize", r"improve",
+        # Debugging
+        r"修复.*bug", r"调试", r"排查", r"fix.*bug", r"debug", r"troubleshoot",
+        # Creation
+        r"创建.*功能", r"生成.*代码", r"构建", r"create.*feature", r"generate.*code", r"build",
+        # Multi-file operations
+        r"多个文件", r"批量", r"multiple.*files", r"batch",
+    ]
+
+    keyword_matches = 0
+    matched_keywords = []
+    for pattern in coding_keywords:
+        if re.search(pattern, last_user_text, re.IGNORECASE):
+            keyword_matches += 1
+            matched_keywords.append(pattern[:20])  # Store first 20 chars
+
+    if keyword_matches >= 3:
+        confidence += settings.COMPLEX_WEIGHT_KEYWORDS * 1.33  # 0.40 by default
+        signals.append(f"coding_keywords({keyword_matches})")
+    elif keyword_matches >= 2:
+        confidence += settings.COMPLEX_WEIGHT_KEYWORDS * 0.83  # 0.25 by default
+        signals.append(f"coding_keywords({keyword_matches})")
+    elif keyword_matches >= 1:
+        confidence += settings.COMPLEX_WEIGHT_KEYWORDS * 0.33  # 0.10 by default
+        signals.append(f"coding_keyword({keyword_matches})")
+
+    # Threshold: configurable via NADIRCLAW_COMPLEX_THRESHOLD
+    is_complex = confidence >= settings.COMPLEX_THRESHOLD
+
+    return {
+        "is_complex": is_complex,
+        "confidence": confidence,
+        "signals": signals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Code review detection
+# ---------------------------------------------------------------------------
+
+# Code review keywords (trigger code verification/review tasks)
+# Only Chinese keywords to avoid false positives on common English words
+_REVIEW_MARKERS = re.compile(
+    r"(审查|核查|检查代码|代码审查|代码质量|静态分析"
+    r"|安全检查|漏洞扫描|代码规范|代码风格|验证代码|审核代码)",
+    re.IGNORECASE,
+)
+
+
+def detect_code_review(
+    prompt: str,
+    last_user_text: str = "",
+) -> Dict[str, Any]:
+    """Detect if a prompt is a code review/verification task.
+
+    Code review tasks should route to Sonnet for high-quality analysis.
+
+    Returns {"is_review": bool, "confidence": float, "signals": list}.
+    """
+    confidence = 0.0
+    signals: List[str] = []
+
+    # Use last user text if available, otherwise use prompt
+    text_to_check = last_user_text or prompt
+
+    # Check for review keywords
+    if _REVIEW_MARKERS.search(text_to_check):
+        confidence = 0.90
+        signals.append("review_keywords")
+
+    # Additional signals for code review context
+    review_context_signals = [
+        r"pull\s*request", r"pr\s*review", r"merge\s*request",
+        r"commit.*review", r"change.*review",
+        r"diff.*check", r"patch.*review",
+        r"代码变更", r"变更审查",
+    ]
+
+    for pattern in review_context_signals:
+        if re.search(pattern, text_to_check, re.IGNORECASE):
+            confidence = max(confidence, 0.85)
+            signals.append("review_context")
+            break
+
+    is_review = confidence >= 0.80
+
+    return {
+        "is_review": is_review,
+        "confidence": confidence,
+        "signals": signals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Claude Code role detection
+# ---------------------------------------------------------------------------
+
+_CLAUDE_CODE_PLANNING_MARKERS = re.compile(
     r"(plan\s*mode\s*is\s*active"
     r"|software\s+architect"
     r"|planning\s+specialist"
@@ -374,207 +741,124 @@ _PLANNING_MARKERS = re.compile(
     re.IGNORECASE,
 )
 
-_EXPLORE_MARKERS = re.compile(
+# User-initiated plan command detection (in user message, not system prompt)
+_PLAN_COMMAND_MARKERS = re.compile(
+    r"(^|\s)/plan\b"
+    r"|实施以下计划"
+    r"|implement\s+the\s+following\s+plan"
+    r"|帮我.*规划"
+    r"|设计.*实现方案"
+    r"|制定.*计划",
+    re.IGNORECASE,
+)
+
+# Explore agent markers (should route to reasoning model like planning)
+_CLAUDE_CODE_EXPLORE_MARKERS = re.compile(
     r"(explore\s+agent"
     r"|explore\s+codebase"
     r"|fast\s+agent\s+specialized\s+for\s+exploring)",
     re.IGNORECASE,
 )
 
-_SUBAGENT_MARKERS = re.compile(
-    r"(specialized\s+agent"
+# Other subagent markers (route to simple model)
+_CLAUDE_CODE_SUBAGENT_MARKERS = re.compile(
+    r"(haiku\s*4\.?5"
+    r"|sonnet\s*4\.?5"
+    r"|specialized\s+agent"
     r"|subagent"
     r"|background\s+agent"
     r"|search\s+agent)",
     re.IGNORECASE,
 )
 
-_EXECUTION_TOOLS = {
-    "Bash", "bash", "shell", "execute", "Write", "Edit",
-    "Task", "Run", "NotebookEdit",
-}
 
-
-def detect_agent_role(
+def detect_claude_code_role(
     system_prompt: str,
     message_count: int = 0,
     tool_names: Optional[List[str]] = None,
+    last_user_message: str = "",
 ) -> Dict[str, Any]:
-    """Detect the role/type of an AI coding agent session.
-
-    Examines the system prompt for markers that indicate whether this is a
-    planning session, an explore agent, a subagent, or a main execution session.
+    """Detect Claude Code agent role from system prompt signals.
 
     Returns {"role": str, "confidence": float, "signals": list[str]}.
-    Role can be: "planning", "explore", "subagent", or "unknown".
+    role can be: "planning", "explore", "subagent", "execution", or "unknown".
     """
     role = "unknown"
     confidence = 0.0
     signals: List[str] = []
     tool_names = tool_names or []
 
-    if _PLANNING_MARKERS.search(system_prompt):
-        return {"role": "planning", "confidence": 0.95, "signals": ["planning_markers"]}
+    # Check for user-initiated /plan command in last user message
+    # This handles the case where user sends /plan but system prompt hasn't been updated yet
+    has_plan_command = bool(_PLAN_COMMAND_MARKERS.search(last_user_message)) if last_user_message else False
 
-    if _EXPLORE_MARKERS.search(system_prompt):
-        return {"role": "explore", "confidence": 0.95, "signals": ["explore_markers"]}
+    # Planning mode detection — check for explicit plan mode indicators in system prompt
+    # NOTE: ExitPlanMode tool is always present and means "can exit plan mode",
+    # NOT "currently in plan mode". So we should NOT use it to detect planning.
+    # Only system prompt markers indicate actual planning mode.
+    has_plan_markers = bool(_CLAUDE_CODE_PLANNING_MARKERS.search(system_prompt))
 
-    # Distinguish subagents from main sessions.
-    # Main sessions have long system prompts with extensive instructions.
-    is_main_session = len(system_prompt) > 15000
+    # Planning detected if either:
+    # 1. System prompt has plan mode markers (Plan mode already active)
+    # 2. User sent /plan command (first request to enter plan mode)
+    if has_plan_markers or has_plan_command:
+        role = "planning"
+        confidence = 0.95
+        if has_plan_markers:
+            signals.append("planning_markers")
+        if has_plan_command:
+            signals.append("plan_command")
+        return {"role": role, "confidence": confidence, "signals": signals}
+        return {"role": role, "confidence": confidence, "signals": signals}
 
-    if not is_main_session and _SUBAGENT_MARKERS.search(system_prompt):
-        return {"role": "subagent", "confidence": 0.90, "signals": ["subagent_markers"]}
+    # Explore agent detection (route to explore model)
+    if _CLAUDE_CODE_EXPLORE_MARKERS.search(system_prompt):
+        role = "explore"
+        confidence = 0.95
+        signals.append("explore_markers")
+        return {"role": role, "confidence": confidence, "signals": signals}
 
+    # ============================================================
+    # CRITICAL FIX: Exclude Claude Code main session from subagent detection
+    # ============================================================
+    # Main session indicators:
+    # 1. "You are Claude Code, Anthropic's official CLI" in system prompt
+    # 2. Large system prompt (>15KB) - main session has extensive instructions
+    #
+    # This prevents the main session from being misclassified as subagent
+    # due to model name mentions like "Haiku 4.5" or "Sonnet 4.5"
+    is_main_session = (
+        "You are Claude Code, Anthropic's official CLI" in system_prompt
+        or len(system_prompt) > 15000
+    )
+
+    # Subagent detection (model identity in system prompt)
+    # ONLY apply if NOT main session
+    if not is_main_session and _CLAUDE_CODE_SUBAGENT_MARKERS.search(system_prompt):
+        role = "subagent"
+        confidence = 0.90
+        signals.append("subagent_markers")
+        return {"role": role, "confidence": confidence, "signals": signals}
+
+    # Short system prompt = likely subagent (but lower confidence, don't override execution)
+    # Only use this as a tiebreaker when no other detection applies
+    # Also skip if this is main session
     if not is_main_session and len(system_prompt) < 5000:
         role = "subagent"
-        confidence = 0.50
+        confidence = 0.50  # Lower confidence - shouldn't override execution (0.70)
         signals.append("short_system_prompt")
+        # Don't return immediately - let other detection take precedence
+
+    # Long conversation + execution tools = execution mode
+    if message_count > 50 and tool_names:
+        exec_tools = [t for t in tool_names if t in _EXECUTION_TOOLS]
+        if len(exec_tools) >= 3:
+            role = "execution"
+            confidence = 0.70
+            signals.append(f"long_conversation_exec_tools({len(exec_tools)})")
+            return {"role": role, "confidence": confidence, "signals": signals}
 
     return {"role": role, "confidence": confidence, "signals": signals}
-
-
-def _get_last_assistant_tool_calls(messages: List[Any]) -> List[str]:
-    """Extract tool names from the last assistant message with tool_use blocks."""
-    for msg in reversed(messages):
-        if getattr(msg, "role", "") != "assistant":
-            continue
-        content = getattr(msg, "content", [])
-        if not isinstance(content, list):
-            continue
-        calls = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                name = block.get("name", "")
-                if name:
-                    calls.append(name)
-        return calls
-    return []
-
-
-# ---------------------------------------------------------------------------
-# Complex coding detection
-# ---------------------------------------------------------------------------
-
-_CODING_KEYWORDS = [
-    r"implement", r"add.*feature", r"refactor", r"optimize", r"improve",
-    r"fix.*bug", r"debug", r"troubleshoot", r"create.*feature",
-    r"generate.*code", r"build", r"multiple.*files", r"batch",
-]
-
-
-def detect_complex_coding(
-    messages: List[Any],
-    message_count: int = 0,
-) -> Dict[str, Any]:
-    """Detect complex coding tasks from recent tool usage patterns.
-
-    Complex coding is signaled by:
-    - Heavy editing (3+ Edit/Write calls in recent messages)
-    - Tool combination patterns (Read + Edit + Bash)
-    - Deep conversations (10+ messages)
-    - Coding task keywords in last user message
-
-    Returns {"is_complex": bool, "confidence": float, "signals": list}.
-    """
-    confidence = 0.0
-    signals: List[str] = []
-
-    # Count actual tool calls from last 6 assistant messages
-    tool_counts: Dict[str, int] = {}
-    assistant_seen = 0
-    for m in reversed(messages):
-        if getattr(m, "role", "") != "assistant":
-            continue
-        assistant_seen += 1
-        if assistant_seen > 6:
-            break
-        content = getattr(m, "content", [])
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    name = block.get("name", "")
-                    tool_counts[name] = tool_counts.get(name, 0) + 1
-
-    # Signal 1: Heavy editing
-    edit_count = sum(tool_counts.get(t, 0) for t in ("Edit", "Write", "NotebookEdit"))
-    if edit_count >= 5:
-        confidence += 0.50
-        signals.append(f"heavy_editing({edit_count})")
-    elif edit_count >= 3:
-        confidence += 0.30
-        signals.append(f"moderate_editing({edit_count})")
-
-    # Signal 2: Tool combination (Read + Edit + Bash)
-    has_read = tool_counts.get("Read", 0) > 0
-    has_edit = any(tool_counts.get(t, 0) > 0 for t in ("Edit", "Write"))
-    has_bash = tool_counts.get("Bash", 0) > 0
-    if has_read and has_edit and has_bash:
-        confidence += 0.30
-        signals.append("read_edit_bash_combo")
-    elif has_read and has_edit:
-        confidence += 0.15
-        signals.append("read_edit_combo")
-
-    # Signal 3: Deep conversation
-    if message_count >= 20:
-        confidence += 0.20
-        signals.append(f"deep_conversation({message_count})")
-    elif message_count >= 10:
-        confidence += 0.10
-        signals.append(f"moderate_conversation({message_count})")
-
-    # Signal 4: Coding keywords in last user message
-    last_user_text = ""
-    for m in reversed(messages):
-        if getattr(m, "role", "") == "user":
-            last_user_text = getattr(m, "text_content", lambda: "")()
-            break
-
-    keyword_hits = sum(
-        1 for p in _CODING_KEYWORDS
-        if re.search(p, last_user_text, re.IGNORECASE)
-    )
-    if keyword_hits >= 3:
-        confidence += 0.40
-        signals.append(f"coding_keywords({keyword_hits})")
-    elif keyword_hits >= 2:
-        confidence += 0.25
-        signals.append(f"coding_keywords({keyword_hits})")
-    elif keyword_hits >= 1:
-        confidence += 0.10
-        signals.append(f"coding_keyword({keyword_hits})")
-
-    is_complex = confidence >= 0.50
-    return {"is_complex": is_complex, "confidence": min(confidence, 1.0), "signals": signals}
-
-
-# ---------------------------------------------------------------------------
-# Code review detection
-# ---------------------------------------------------------------------------
-
-_REVIEW_MARKERS = re.compile(
-    r"(code\s*review|review\s*(?:the\s+)?(?:code|changes|pr|diff)"
-    r"|pull\s*request\s*review|security\s*(?:audit|review)"
-    r"|static\s*analysis|lint\s*check)",
-    re.IGNORECASE,
-)
-
-
-def detect_code_review(prompt: str) -> Dict[str, Any]:
-    """Detect code review/verification tasks.
-
-    Returns {"is_review": bool, "confidence": float, "signals": list}.
-    """
-    confidence = 0.0
-    signals: List[str] = []
-
-    if _REVIEW_MARKERS.search(prompt):
-        confidence = 0.90
-        signals.append("review_keywords")
-
-    is_review = confidence >= 0.80
-    return {"is_review": is_review, "confidence": confidence, "signals": signals}
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +948,11 @@ class SessionCache:
         self._lock = Lock()
 
     def _make_key(self, messages: List[Any]) -> str:
-        """Generate a session key from conversation shape."""
+        """Generate a session key from conversation shape.
+
+        Uses system prompt + last user message so that each new user input
+        gets a fresh routing decision instead of being locked to the first one.
+        """
         parts: List[str] = []
         for m in messages:
             role = getattr(m, "role", "")
@@ -673,11 +961,13 @@ class SessionCache:
                 parts.append(f"sys:{content[:200]}")
                 break
 
-        # First user message
-        for m in messages:
+        # Last user message — allows re-routing when the user changes topic
+        for m in reversed(messages):
             role = getattr(m, "role", "")
             if role == "user":
                 content = getattr(m, "text_content", lambda: "")()
+                # Strip system-reminder for cache key consistency
+                content = re.sub(r'<system-reminder>.*?</system-reminder>', '', content, flags=re.DOTALL).strip()
                 parts.append(f"usr:{content[:200]}")
                 break
 
@@ -762,116 +1052,6 @@ def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Opt
 # Main routing modifier — applies all intelligence
 # ---------------------------------------------------------------------------
 
-def _apply_agent_role_routing(
-    agent_role: Dict[str, Any],
-    messages: List[Any],
-    final_model: str,
-    final_tier: str,
-    simple_model: str,
-    complex_model: str,
-    reasoning_model: Optional[str],
-    explore_model: Optional[str],
-    subagent_model: Optional[str],
-    free_model: Optional[str],
-    routing_info: Dict[str, Any],
-) -> None:
-    """Apply agent role-based routing decisions.
-
-    Mutates routing_info by setting final_model/final_tier and appending
-    modifiers. The caller reads these back and removes the temp keys.
-    """
-    role_type = agent_role.get("role", "unknown")
-    confidence = agent_role.get("confidence", 0.0)
-
-    if role_type == "planning" and confidence >= 0.90:
-        _route_planning_session(
-            messages, final_model, final_tier,
-            simple_model, complex_model, reasoning_model,
-            subagent_model, free_model, routing_info,
-        )
-    elif role_type == "explore" and confidence >= 0.90:
-        target = explore_model or complex_model
-        routing_info["modifiers_applied"].append("agent_role[EXPLORE]")
-        logger.info("Role routing [EXPLORE]: → %s", target)
-        routing_info["final_model"] = target
-        routing_info["final_tier"] = "explore"
-        return
-
-    elif role_type == "subagent" and confidence >= 0.60:
-        target = subagent_model or free_model or simple_model
-        if final_tier not in ("reasoning", "explore"):
-            routing_info["modifiers_applied"].append("agent_role[SUBAGENT]")
-            logger.info("Role routing [SUBAGENT]: → %s (conf=%.2f)", target, confidence)
-            routing_info["final_model"] = target
-            routing_info["final_tier"] = "subagent"
-            return
-
-    # No role override — pass through current values
-    routing_info["final_model"] = final_model
-    routing_info["final_tier"] = final_tier
-
-
-def _route_planning_session(
-    messages: List[Any],
-    final_model: str,
-    final_tier: str,
-    simple_model: str,
-    complex_model: str,
-    reasoning_model: Optional[str],
-    subagent_model: Optional[str],
-    free_model: Optional[str],
-    routing_info: Dict[str, Any],
-) -> None:
-    """Route planning sessions based on the driving phase.
-
-    Planning phases:
-    - USER: new user request (no tool result) → reasoning model for decision-making
-    - EXPLORATION: last tool call was exploration (Read, Glob, etc.) → fast model
-    - PLAN_GENERATION: last tool call was write/edit → reasoning model for quality
-    - CONTEXT: indeterminate → fast model (default)
-    """
-    last_message_is_tool = False
-    if messages:
-        last_message_is_tool = getattr(messages[-1], "role", "") == "tool"
-
-    last_tool_calls = _get_last_assistant_tool_calls(messages)
-    exploration_tools = {"Read", "Bash", "Glob", "Grep", "WebFetch", "WebSearch"}
-    plan_tools = {"Write", "Edit", "ExitPlanMode", "AskUserQuestion"}
-
-    called_exploration = bool(set(last_tool_calls) & exploration_tools)
-    called_plan = bool(set(last_tool_calls) & plan_tools)
-
-    use_reasoning = False
-    driver = "CONTEXT"
-
-    if not last_message_is_tool:
-        use_reasoning = True
-        driver = "USER"
-    elif called_plan:
-        use_reasoning = True
-        driver = "PLAN_GENERATION"
-    elif called_exploration:
-        use_reasoning = False
-        driver = "EXPLORATION"
-
-    if use_reasoning:
-        target = reasoning_model or complex_model
-        routing_info["modifiers_applied"].append(f"planning[{driver}]")
-        logger.info("Plan routing [%s]: → %s", driver, target)
-        routing_info["final_model"] = target
-        routing_info["final_tier"] = "reasoning"
-    else:
-        target = subagent_model or free_model or simple_model
-        routing_info["modifiers_applied"].append(f"planning[{driver}]")
-        logger.info("Plan routing [%s]: → %s", driver, target)
-        routing_info["final_model"] = target
-        routing_info["final_tier"] = "subagent"
-
-
-# ---------------------------------------------------------------------------
-# Main routing modifier — applies all intelligence
-# ---------------------------------------------------------------------------
-
 def apply_routing_modifiers(
     base_model: str,
     base_tier: str,
@@ -881,8 +1061,11 @@ def apply_routing_modifiers(
     complex_model: str,
     reasoning_model: Optional[str] = None,
     free_model: Optional[str] = None,
+    sonnet_model: Optional[str] = None,
     explore_model: Optional[str] = None,
     subagent_model: Optional[str] = None,
+    review_model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
     """Apply all routing modifiers on top of the classifier's base decision.
 
@@ -897,30 +1080,54 @@ def apply_routing_modifiers(
     final_model = base_model
     final_tier = base_tier
 
-    # --- Agent role detection ---
+    # --- Claude Code role detection (early check) ---
     system_text = request_meta.get("system_prompt_text", "")
-    tool_names = request_meta.get("tool_names", [])
     message_count = request_meta.get("message_count", 0)
+    tool_names = request_meta.get("tool_names", [])
 
-    agent_role = detect_agent_role(
-        system_prompt=system_text,
+    # Extract ALL user messages to check for Plan mode markers in system-reminder
+    # Plan mode markers appear in the FIRST user message's <system-reminder> tags
+    all_user_texts_for_role = []
+    for m in messages:
+        if getattr(m, "role", "") == "user":
+            user_text = getattr(m, "text_content", lambda: "")() or ""
+            all_user_texts_for_role.append(user_text)
+
+    # Combine system prompt + ALL user messages for role detection
+    # This ensures we detect Plan mode markers anywhere in the conversation
+    combined_text_for_role = system_text + "\n" + "\n".join(all_user_texts_for_role)
+
+    # Get last user message for /plan command detection
+    last_user_text_for_role = all_user_texts_for_role[-1] if all_user_texts_for_role else ""
+
+    cc_role = detect_claude_code_role(
+        system_prompt=combined_text_for_role,
         message_count=message_count,
         tool_names=tool_names,
+        last_user_message=last_user_text_for_role,
     )
-    routing_info["agent_role"] = agent_role
+    routing_info["claude_code_role"] = cc_role
 
     # --- Agentic detection ---
     agentic = detect_agentic(
         messages=messages,
         has_tools=request_meta.get("has_tools", False),
         tool_count=request_meta.get("tool_count", 0),
-        system_prompt=request_meta.get("system_prompt_text", ""),
+        system_prompt=system_text,
         system_prompt_length=request_meta.get("system_prompt_length", 0),
-        message_count=request_meta.get("message_count", 0),
+        message_count=message_count,
     )
     routing_info["agentic"] = agentic
 
-    if agentic["is_agentic"] and final_tier == "simple":
+    # Skip agentic override for Claude Code main session — it always has
+    # 200+ tools and long conversations, so agentic detection is meaningless.
+    # Let complex_coding / code_review / reasoning handle upgrades instead.
+    is_main_session = (
+        "You are Claude Code, Anthropic's official CLI" in system_text
+        or request_meta.get("system_prompt_length", 0) > 15000
+    )
+
+    if agentic["is_agentic"] and final_tier == "simple" and not is_main_session:
         final_model = complex_model
         final_tier = "complex"
         routing_info["modifiers_applied"].append("agentic_override")
@@ -928,44 +1135,314 @@ def apply_routing_modifiers(
             "Agentic override: simple → complex (confidence=%.2f, signals=%s)",
             agentic["confidence"], agentic["signals"],
         )
+    elif agentic["is_agentic"] and is_main_session:
+        routing_info["modifiers_applied"].append("agentic_skipped(main_session)")
+        logger.debug(
+            "Agentic skipped for main session (confidence=%.2f, signals=%s)",
+            agentic["confidence"], agentic["signals"],
+        )
 
-    # --- Reasoning detection ---
-    prompt_text = ""
-    system_text = ""
+    # --- Reasoning detection (ONLY check last user message, not conversation history) ---
+    all_user_texts = []
     for m in messages:
         role = getattr(m, "role", "")
         text = getattr(m, "text_content", lambda: "")()
         if role == "user":
-            prompt_text = text
-        elif role in ("system", "developer"):
-            system_text = text
+            all_user_texts.append(text)
 
-    reasoning = detect_reasoning(prompt_text, system_text)
+    # Only use the LAST user message for reasoning detection
+    # Strip <system-reminder> tags to avoid false positives from Claude Code internals
+    last_user_text = all_user_texts[-1] if all_user_texts else ""
+    last_user_text_clean = re.sub(
+        r'<system-reminder>.*?</system-reminder>', '', last_user_text, flags=re.DOTALL
+    ).strip()
+
+    # Check if the LAST message in the conversation is a tool result
+    # We only skip reasoning detection if we're processing tool results
+    # (i.e., last message is tool output), NOT if tool results exist anywhere in history
+    last_message_is_tool = False
+    if messages:
+        last_role = getattr(messages[-1], "role", "")
+        last_message_is_tool = (last_role == "tool")
+
+    # DEBUG: Log what we found
+    logger.debug(
+        "Reasoning detection: last_message_is_tool=%s, last_user_text=%.100s...",
+        last_message_is_tool, last_user_text[:100] if last_user_text else "",
+    )
+
+    # IMPORTANT: Skip reasoning detection only if the last message is a tool result
+    # When the last message is a tool result, we're processing tool output, not new user input.
+    # But if the user sends a NEW prompt (even with tool results in history),
+    # we should still detect reasoning in that new prompt.
+    if last_message_is_tool:
+        reasoning = {"is_reasoning": False, "marker_count": 0, "markers": [], "skipped": "last_message_is_tool_result"}
+        logger.debug("Reasoning skipped: last message is tool result")
+    else:
+        reasoning = detect_reasoning(last_user_text_clean, system_text)
+        logger.debug(
+            "Reasoning detection result: is_reasoning=%s, markers=%s",
+            reasoning["is_reasoning"], reasoning["markers"],
+        )
     routing_info["reasoning"] = reasoning
 
+    # Token-based Sonnet downgrade: >96k tokens → use Sonnet instead of Opus
+    HIGH_TOKEN_THRESHOLD = 96_000
+    estimated_tokens = estimate_token_count(messages)
+    use_sonnet_for_reasoning = False
+
+    if estimated_tokens > HIGH_TOKEN_THRESHOLD and sonnet_model:
+        use_sonnet_for_reasoning = True
+        routing_info["high_token_downgrade"] = {
+            "estimated_tokens": estimated_tokens,
+            "threshold": HIGH_TOKEN_THRESHOLD,
+            "target": sonnet_model,
+        }
+
     if reasoning["is_reasoning"]:
-        target = reasoning_model or complex_model
+        # Use Sonnet if high token count, otherwise use reasoning model
+        if use_sonnet_for_reasoning:
+            target = sonnet_model or reasoning_model or complex_model
+            tier_name = "reasoning_sonnet"
+        else:
+            target = reasoning_model or complex_model
+            tier_name = "reasoning"
+
         if final_model != target:
             final_model = target
-            final_tier = "reasoning"
+            final_tier = tier_name
             routing_info["modifiers_applied"].append("reasoning_override")
             logger.info(
-                "Reasoning override: → %s (markers=%d: %s)",
-                target, reasoning["marker_count"], reasoning["markers"],
+                "Reasoning override: → %s (markers=%d: %s, tokens=%d)",
+                target, reasoning["marker_count"], reasoning["markers"], estimated_tokens,
             )
 
-    # --- Agent role-based routing ---
-    _apply_agent_role_routing(
-        agent_role, messages, final_model, final_tier,
-        simple_model, complex_model, reasoning_model,
-        explore_model, subagent_model, free_model,
-        routing_info,
+    # --- Complex coding detection ---
+    # Detect complex coding tasks that should route to Sonnet
+    # Priority: reasoning > complex > execution > subagent
+    complex_coding = detect_complex_coding(
+        messages=messages,
+        tool_names=tool_names,
+        last_tool_call=request_meta.get("last_tool_call"),
+        message_count=message_count,
+        system_prompt_length=request_meta.get("system_prompt_length", 0),
     )
-    final_model = routing_info["final_model"]
-    final_tier = routing_info["final_tier"]
-    # Clean up temp keys set by _apply_agent_role_routing
-    routing_info.pop("final_model", None)
-    routing_info.pop("final_tier", None)
+    routing_info["complex_coding"] = complex_coding
+
+    # Only upgrade to complex if not already reasoning/planning
+    if complex_coding["is_complex"] and final_tier not in ("reasoning", "reasoning_sonnet"):
+        target = complex_model  # claude-sonnet-4-6
+        if final_model != target:
+            routing_info["modifiers_applied"].append("complex_coding_override")
+            logger.info(
+                "Complex coding override: → %s (confidence=%.2f, signals=%s)",
+                target, complex_coding["confidence"], complex_coding["signals"],
+            )
+            final_model = target
+            final_tier = "complex"
+
+    # --- Code review detection ---
+    # Detect code review/verification tasks that should route to review model (Sonnet)
+    # Priority: reasoning > review > complex > execution > subagent
+    code_review = detect_code_review(
+        prompt=last_user_text_clean,
+        last_user_text=last_user_text_clean,
+    )
+    routing_info["code_review"] = code_review
+
+    # Only upgrade to review if not already reasoning
+    if code_review["is_review"] and final_tier not in ("reasoning", "reasoning_sonnet"):
+        target = review_model or complex_model  # claude-sonnet-4-6
+        if final_model != target:
+            routing_info["modifiers_applied"].append("code_review_override")
+            logger.info(
+                "Code review override: → %s (confidence=%.2f, signals=%s)",
+                target, code_review["confidence"], code_review["signals"],
+            )
+            final_model = target
+            final_tier = "review"
+
+    # --- Execution detection (route to simple model for execution tasks) ---
+    # --- Execution detection (route to simple model for execution tasks) ---
+    last_user_text = all_user_texts[-1] if all_user_texts else ""
+    last_user_text_clean = re.sub(
+        r'<system-reminder>.*?</system-reminder>', '', last_user_text, flags=re.DOTALL
+    ).strip()
+    execution = detect_execution(
+        prompt=last_user_text_clean,
+        tool_names=tool_names,
+        last_tool_call=request_meta.get("last_tool_call"),
+    )
+    routing_info["execution"] = execution
+
+    # If execution detected AND not already routed to reasoning/complex/review → use simple model
+    # Complex coding tasks and code review may include execution commands, so don't downgrade them
+    if execution["is_execution"] and final_tier not in ("reasoning", "reasoning_sonnet", "complex", "review"):
+        if final_model != simple_model:
+            routing_info["modifiers_applied"].append(
+                f"execution_override({final_tier}→simple)"
+            )
+            logger.info(
+                "Execution override: → %s (confidence=%.2f, signals=%s)",
+                simple_model, execution["confidence"], execution["signals"],
+            )
+            final_model = simple_model
+            final_tier = "execution"
+        elif final_tier == "simple":
+            # Already at simple model, but record the execution detection and update tier name
+            routing_info["modifiers_applied"].append("execution_detected")
+            logger.info(
+                "Execution detected (already simple): confidence=%.2f, signals=%s",
+                execution["confidence"], execution["signals"],
+            )
+            final_tier = "execution"
+
+    # ============================================================
+    # Claude Code Role Override - Plan Mode Routing Decision
+    # ============================================================
+    #
+    # Plan模式下的请求分类（按驱动类型）:
+    #
+    # ┌─────────────────────────────────────────────────────────────┐
+    # │ 驱动类型          │ 触发条件                 │ 路由目标     │
+    # ├─────────────────────────────────────────────────────────────┤
+    # │ [USER] 用户启动    │ 新请求（无tool result）  │ Opus        │
+    # │                    │ 如 /plan 或拒绝后重生成   │             │
+    # ├─────────────────────────────────────────────────────────────┤
+    # │ [EXPLORATION]      │ 上轮调用探索工具         │ GLM-5       │
+    # │ 探索过程中         │ Read/Bash/Glob返回结果   │             │
+    # ├─────────────────────────────────────────────────────────────┤
+    # │ [PLAN_GENERATION]  │ 上轮调用 Write/Edit/     │ Opus        │
+    # │ 生成/更新Plan      │ ExitPlanMode             │             │
+    # ├─────────────────────────────────────────────────────────────┤
+    # │ [CONTEXT] 系统上下文│ tool result但无法判断    │ GLM-5       │
+    # │ (默认fallback)     │ 上轮工具类型             │             │
+    # └─────────────────────────────────────────────────────────────┘
+    #
+    # 完整流程示例:
+    # 用户: /plan create deployment
+    #   → [USER] Opus（决策：需要探索）
+    #   → Opus调用 Read, Glob
+    #   → [EXPLORATION] GLM-5（快速处理结果，继续探索）
+    #   → GLM-5调用 Bash, Grep
+    #   → [EXPLORATION] GLM-5（继续处理）
+    #   → GLM-5判断信息足够，调用 Write
+    #   → [PLAN_GENERATION] Opus（生成高质量plan）
+    #
+    cc_role_type = cc_role.get("role", "unknown")
+    if cc_role_type == "planning" and cc_role["confidence"] >= 0.90:
+
+        # --- Step 1: 判断当前请求类型 ---
+        last_message_is_tool = False
+        if messages:
+            last_role = getattr(messages[-1], "role", "")
+            last_message_is_tool = (last_role == "tool")
+
+        # --- Step 2: 提取上一轮assistant的工具调用 ---
+        last_assistant_tool_calls = []
+        for msg in reversed(messages):
+            if getattr(msg, "role", "") == "assistant":
+                content = getattr(msg, "content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            tool_name = block.get("name", "")
+                            if tool_name:
+                                last_assistant_tool_calls.append(tool_name)
+                break
+
+        # --- Step 3: 工具分类 ---
+        exploration_tools = {"Read", "Bash", "Glob", "Grep", "WebFetch", "WebSearch"}
+        plan_tools = {"Write", "Edit", "ExitPlanMode", "AskUserQuestion"}
+
+        last_called_exploration = bool(set(last_assistant_tool_calls) & exploration_tools)
+        last_called_plan = bool(set(last_assistant_tool_calls) & plan_tools)
+
+        # --- Step 4: 路由决策 ---
+        # 分类: [USER] [EXPLORATION] [PLAN_GENERATION] [CONTEXT]
+        use_reasoning_model = False
+        driver_type = "CONTEXT"  # 默认：系统上下文驱动 → GLM-5
+        reason = "context_driven"  # 默认原因
+
+        if not last_message_is_tool:
+            # [USER] 用户启动驱动 - 用户发送新请求（如/plan）
+            # 首次请求或拒绝后重新生成 → 需要Opus的决策能力
+            use_reasoning_model = True
+            driver_type = "USER"
+            reason = "user_initiated"
+        elif last_called_plan:
+            # [PLAN_GENERATION] Plan生成/更新驱动
+            # 上轮已调用Write/Edit → 正在写plan → 用Opus保证质量
+            use_reasoning_model = True
+            driver_type = "PLAN_GENERATION"
+            reason = f"writing_plan({','.join(last_assistant_tool_calls[:3])})"
+        elif last_called_exploration:
+            # [EXPLORATION] 探索过程中
+            # 上轮调用探索工具 → 快速处理结果，继续探索 → GLM-5
+            use_reasoning_model = False
+            driver_type = "EXPLORATION"
+            reason = f"exploring({','.join(last_assistant_tool_calls[:3])})"
+        # else: [CONTEXT] 无法判断上轮工具 → 默认GLM-5
+
+        # --- Step 5: 应用路由 ---
+        if use_reasoning_model:
+            target = reasoning_model or complex_model
+            if final_model != target:
+                routing_info["modifiers_applied"].append(f"cc_planning[{driver_type}]")
+                logger.info(
+                    "Plan routing [%s]: → %s (%s)",
+                    driver_type, target, reason,
+                )
+                final_model = target
+                final_tier = "reasoning"
+        else:
+            # [EXPLORATION] 或 [CONTEXT] → 用GLM-5快速探索
+            target = subagent_model or simple_model
+            if final_model != target:
+                routing_info["modifiers_applied"].append(f"planning[{driver_type}]")
+                logger.info(
+                    "Plan routing [%s]: → %s (%s)",
+                    driver_type, target, reason,
+                )
+                final_model = target
+                final_tier = "subagent"
+    elif cc_role_type == "explore" and cc_role["confidence"] >= 0.90:
+        # Explore agent: use explore_model for codebase search/exploration
+        # 驱动类型: [EXPLORE_AGENT] Claude Code Explore子代理
+        target = explore_model or complex_model
+        if final_model != target:
+            routing_info["modifiers_applied"].append("cc_role[EXPLORE]")
+            logger.info(
+                "Role routing [EXPLORE]: → %s",
+                target,
+            )
+            final_model = target
+            final_tier = "explore"
+    elif cc_role_type == "subagent" and cc_role["confidence"] >= 0.60:
+        # Subagent/Execution tasks → SUBAGENT model (glm-5, coding plan model)
+        # 驱动类型: [SUBAGENT] Claude Code子代理后台任务
+        # Priority: reasoning > explore > subagent
+        target_subagent_model = subagent_model or free_model or simple_model
+        if final_tier not in ("reasoning", "reasoning_sonnet", "explore"):
+            # High confidence subagent (explicit markers) can override execution
+            # Low confidence subagent (short system prompt) only applies if not already execution
+            can_override = cc_role["confidence"] >= 0.85 or final_tier not in ("execution",)
+
+            if final_model != target_subagent_model:
+                routing_info["modifiers_applied"].append("cc_role[SUBAGENT]")
+                logger.info(
+                    "Role routing [SUBAGENT]: → %s (conf=%.2f)",
+                    target_subagent_model, cc_role["confidence"],
+                )
+                final_model = target_subagent_model
+                final_tier = "subagent"
+            elif final_tier in ("simple", "complex") or (can_override and final_tier == "execution"):
+                routing_info["modifiers_applied"].append("cc_role[SUBAGENT]_detected")
+                logger.info(
+                    "Role routing [SUBAGENT]: already at %s (conf=%.2f)",
+                    target_subagent_model, cc_role["confidence"],
+                )
+                final_tier = "subagent"
 
     # --- Vision detection ---
     if request_meta.get("has_images", False) and not has_vision(final_model):
@@ -988,43 +1465,45 @@ def apply_routing_modifiers(
     if request_meta.get("has_images", False):
         routing_info["has_images"] = True
 
+    # --- Long context auto-routing to Gemini ---
+    # When token count exceeds 200K, route to Gemini 3.1 Pro (2M context window)
+    LONG_CONTEXT_THRESHOLD = 200_000
+    GEMINI_LONG_CONTEXT_MODEL = "gemini-3.1-pro"
+
+    # Reuse estimated_tokens from earlier calculation
+    if estimated_tokens > LONG_CONTEXT_THRESHOLD:
+        # Check if Gemini is available and has larger context window
+        gemini_info = MODEL_REGISTRY.get(GEMINI_LONG_CONTEXT_MODEL)
+        if gemini_info and gemini_info.get("context_window", 0) > estimated_tokens:
+            routing_info["modifiers_applied"].append(
+                f"long_context_routing({final_model}→{GEMINI_LONG_CONTEXT_MODEL}, tokens={estimated_tokens})"
+            )
+            logger.info(
+                "Long context auto-routing: %s → %s (est=%d tokens > %d threshold)",
+                final_model, GEMINI_LONG_CONTEXT_MODEL, estimated_tokens, LONG_CONTEXT_THRESHOLD,
+            )
+            final_model = GEMINI_LONG_CONTEXT_MODEL
+            final_tier = "long_context"
+
     # --- Context window check ---
     if not check_context_window(final_model, messages):
-        estimated = estimate_token_count(messages)
         window = get_context_window(final_model)
         # Try the other model
         alt_model = complex_model if final_model == simple_model else simple_model
         if check_context_window(alt_model, messages):
             routing_info["modifiers_applied"].append(
-                f"context_window_swap({final_model}→{alt_model}, est={estimated}, limit={window})"
+                f"context_window_swap({final_model}→{alt_model}, est={estimated_tokens}, limit={window})"
             )
             logger.warning(
                 "Context window exceeded for %s (est=%d, limit=%s) → swapping to %s",
-                final_model, estimated, window, alt_model,
+                final_model, estimated_tokens, window, alt_model,
             )
             final_model = alt_model
         else:
             logger.warning(
                 "Context window exceeded for all models (est=%d tokens). Proceeding with %s.",
-                estimated, final_model,
+                estimated_tokens, final_model,
             )
-
-    # --- Model Pool Selection ---
-    # If the final model belongs to a pool, select from the pool based on weights.
-    # Skip pool override for tiers where the model was explicitly chosen by reasoning
-    # or agentic detection — pool selection is for load-balancing equivalent models.
-    pool_name = get_pool_for_model(final_model)
-    if pool_name and final_tier not in ("complex", "reasoning"):
-        original_model = final_model
-        final_model = select_from_pool(pool_name)
-        if final_model != original_model:
-            routing_info["modifiers_applied"].append(
-                f"pool_selection({pool_name}: {original_model}→{final_model})"
-            )
-            logger.info(
-                "Model pool %s: %s → %s", pool_name, original_model, final_model,
-            )
-        routing_info["pool_name"] = pool_name
 
     routing_info["final_model"] = final_model
     routing_info["final_tier"] = final_tier

@@ -134,24 +134,41 @@ class Settings:
         return Path(os.getenv("NADIRCLAW_LOG_DIR", "~/.nadirclaw/logs")).expanduser()
 
     @property
+    def CREDENTIALS_FILE(self) -> Path:
+        return Path.home() / ".nadirclaw" / "credentials.json"
+
+    @property
     def LOG_MAX_SIZE_MB(self) -> int:
-        """Max size of requests.jsonl before rotation (MB)."""
         return int(os.getenv("NADIRCLAW_LOG_MAX_SIZE_MB", "50"))
 
     @property
     def LOG_RETENTION_DAYS(self) -> int:
-        """Days to keep old log archives and SQLite rows."""
         return int(os.getenv("NADIRCLAW_LOG_RETENTION_DAYS", "30"))
 
     @property
     def LOG_COMPRESS(self) -> bool:
-        """Gzip rotated JSONL files."""
-        val = os.getenv("NADIRCLAW_LOG_COMPRESS", "true").lower()
-        return val in ("1", "true", "yes")
+        return os.getenv("NADIRCLAW_LOG_COMPRESS", "true").lower() in ("1", "true", "yes")
 
     @property
-    def CREDENTIALS_FILE(self) -> Path:
-        return Path.home() / ".nadirclaw" / "credentials.json"
+    def OPTIMIZE(self) -> str:
+        return os.getenv("NADIRCLAW_OPTIMIZE", "off")
+
+    @property
+    def OPTIMIZE_MAX_TURNS(self) -> int:
+        return int(os.getenv("NADIRCLAW_OPTIMIZE_MAX_TURNS", "20"))
+
+    @property
+    def CONTEXT_COMPRESSION(self) -> str:
+        """Context compression mode. Default: 'false'."""
+        return os.getenv("NADIRCLAW_CONTEXT_COMPRESSION", "false")
+
+    @property
+    def MID_MODEL(self) -> str:
+        return os.getenv("NADIRCLAW_MID_MODEL", "") or self.SIMPLE_MODEL
+
+    @property
+    def has_mid_tier(self) -> bool:
+        return bool(os.getenv("NADIRCLAW_MID_MODEL", ""))
 
     @property
     def REASONING_MODEL(self) -> str:
@@ -159,9 +176,80 @@ class Settings:
         return os.getenv("NADIRCLAW_REASONING_MODEL", "") or self.COMPLEX_MODEL
 
     @property
+    def SONNET_MODEL(self) -> str:
+        """Model for medium-complexity tasks (2000-20000 tokens). Falls back to COMPLEX_MODEL."""
+        return os.getenv("NADIRCLAW_SONNET_MODEL", "") or self.COMPLEX_MODEL
+
+    @property
+    def EXPLORE_MODEL(self) -> str:
+        """Model for Claude Code explore agent. Falls back to COMPLEX_MODEL."""
+        return os.getenv("NADIRCLAW_EXPLORE_MODEL", "") or self.COMPLEX_MODEL
+
+    @property
     def FREE_MODEL(self) -> str:
         """Free fallback model. Falls back to SIMPLE_MODEL."""
         return os.getenv("NADIRCLAW_FREE_MODEL", "") or self.SIMPLE_MODEL
+
+    @property
+    def SUBAGENT_MODEL(self) -> str:
+        """Model for Claude Code subagent/execution tasks.
+        These are background coding-plan tasks that use API quota.
+        Falls back to COMPLEX_MODEL if not set.
+        """
+        return os.getenv("NADIRCLAW_SUBAGENT_MODEL", "") or self.COMPLEX_MODEL
+
+    @property
+    def EXECUTION_MODEL(self) -> str:
+        """Model for Claude Code execution tasks. Falls back to SUBAGENT_MODEL."""
+        return os.getenv("NADIRCLAW_EXECUTION_MODEL", "") or self.SUBAGENT_MODEL
+
+    @property
+    def LONG_CONTEXT_MODEL(self) -> str:
+        """Model for long context requests. Falls back to REASONING_MODEL."""
+        return os.getenv("NADIRCLAW_LONG_CONTEXT_MODEL", "") or self.REASONING_MODEL
+
+    # ============================================================
+    # Complex Coding Detection Configuration
+    # ============================================================
+
+    @property
+    def COMPLEX_THRESHOLD(self) -> float:
+        """Threshold for complex coding detection.
+
+        Higher values = more conservative (fewer requests routed to Complex).
+        Lower values = more aggressive (more requests routed to Complex).
+
+        Recommended values:
+        - 0.50: Aggressive (start here for testing)
+        - 0.60: Conservative (production default)
+        - 0.70: Very conservative (reduce cost)
+        """
+        return float(os.getenv("NADIRCLAW_COMPLEX_THRESHOLD", "0.60"))
+
+    @property
+    def COMPLEX_WEIGHT_EDITING(self) -> float:
+        """Weight for heavy editing signal (3+ Edit/Write calls)."""
+        return float(os.getenv("NADIRCLAW_COMPLEX_WEIGHT_EDITING", "0.50"))
+
+    @property
+    def COMPLEX_WEIGHT_COMBO(self) -> float:
+        """Weight for tool combination signal (Read + Edit + Bash)."""
+        return float(os.getenv("NADIRCLAW_COMPLEX_WEIGHT_COMBO", "0.30"))
+
+    @property
+    def COMPLEX_WEIGHT_CONVERSATION(self) -> float:
+        """Weight for deep conversation signal (10+ messages)."""
+        return float(os.getenv("NADIRCLAW_COMPLEX_WEIGHT_CONVERSATION", "0.20"))
+
+    @property
+    def COMPLEX_WEIGHT_KEYWORDS(self) -> float:
+        """Weight for coding keywords signal (implement, refactor, etc.)."""
+        return float(os.getenv("NADIRCLAW_COMPLEX_WEIGHT_KEYWORDS", "0.30"))
+
+    @property
+    def REVIEW_MODEL(self) -> str:
+        """Model for code review/verification tasks. Falls back to COMPLEX_MODEL."""
+        return os.getenv("NADIRCLAW_REVIEW_MODEL", "") or self.COMPLEX_MODEL
 
     @property
     def FALLBACK_CHAIN(self) -> list[str]:
@@ -169,7 +257,7 @@ class Settings:
 
         Defaults to [COMPLEX_MODEL, SIMPLE_MODEL] (existing behavior).
         Set NADIRCLAW_FALLBACK_CHAIN to customize, e.g.:
-          NADIRCLAW_FALLBACK_CHAIN=gpt-4.1,claude-sonnet-4-5-20250929,gemini-2.5-flash
+          NADIRCLAW_FALLBACK_CHAIN=gpt-5.4,claude-sonnet-4-6,gemini-2.5-flash
         """
         raw = os.getenv("NADIRCLAW_FALLBACK_CHAIN", "")
         if raw:
@@ -186,8 +274,8 @@ class Settings:
 
         Per-tier chains are configured via env vars:
           NADIRCLAW_SIMPLE_FALLBACK=gemini-2.5-flash,gemini-3-flash-preview
-          NADIRCLAW_MID_FALLBACK=gpt-4.1-mini,gemini-2.5-flash
-          NADIRCLAW_COMPLEX_FALLBACK=claude-sonnet-4-5-20250929,gpt-4.1
+          NADIRCLAW_MID_FALLBACK=gpt-5.4-mini,gemini-2.5-flash
+          NADIRCLAW_COMPLEX_FALLBACK=claude-sonnet-4-6,gpt-5.4
 
         When a per-tier chain is set, it is used instead of the global chain.
         If no per-tier chain is configured, falls back to the global FALLBACK_CHAIN.
@@ -212,27 +300,6 @@ class Settings:
             return 0
 
     @property
-    def OPTIMIZE(self) -> str:
-        """Context optimization mode: off, safe, aggressive. Default: off."""
-        val = os.getenv("NADIRCLAW_OPTIMIZE", "off").lower()
-        if val not in ("off", "safe", "aggressive"):
-            _settings_logger.warning(
-                "Invalid NADIRCLAW_OPTIMIZE=%r — expected off|safe|aggressive. "
-                "Falling back to 'off'.",
-                val,
-            )
-            return "off"
-        return val
-
-    @property
-    def OPTIMIZE_MAX_TURNS(self) -> int:
-        """Max conversation turns to keep when trimming. Default: 40."""
-        try:
-            return max(4, int(os.getenv("NADIRCLAW_OPTIMIZE_MAX_TURNS", "40")))
-        except ValueError:
-            return 40
-
-    @property
     def has_explicit_tiers(self) -> bool:
         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""
         return bool(
@@ -241,12 +308,32 @@ class Settings:
 
     @property
     def tier_models(self) -> list[str]:
-        """Deduplicated list of tier models: [COMPLEX, MID, SIMPLE]."""
-        models = [self.COMPLEX_MODEL]
-        if self.has_mid_tier and self.MID_MODEL not in models:
-            models.append(self.MID_MODEL)
-        if self.SIMPLE_MODEL not in models:
-            models.append(self.SIMPLE_MODEL)
+        """Deduplicated list of all tier models + Claude Code model aliases."""
+        seen = set()
+        models = []
+        # Include all tier models + full fallback chain
+        all_models = [
+            self.SIMPLE_MODEL,
+            self.COMPLEX_MODEL,
+            self.MID_MODEL,
+            self.SONNET_MODEL,
+            self.REASONING_MODEL,
+            self.FREE_MODEL,
+        ] + self.FALLBACK_CHAIN
+        for m in all_models:
+            if m and m not in seen:
+                seen.add(m)
+                models.append(m)
+        # Claude Code queries /v1/models to verify its selected model exists.
+        # Expose common Claude model IDs so CC doesn't reject them.
+        for alias in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ]:
+            if alias not in seen:
+                seen.add(alias)
+                models.append(alias)
         return models
 
 
