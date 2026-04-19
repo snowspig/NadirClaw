@@ -432,15 +432,14 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     Uses separate regexes for English (with \\b word boundaries) and Chinese
     (without \\b, since CJK characters have no word boundaries).
 
-    Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
-
-    NOTE: Only checks the user prompt, NOT the system message.
+    Only checks the user prompt, NOT the system message.
     System messages in Claude Code contain many reasoning-related instructions
     that would cause false positives for every request.
+
+    Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
     """
-    combined = f"{system_message} {prompt}"
-    en_matches = _REASONING_MARKERS_EN.findall(combined)
-    zh_matches = _REASONING_MARKERS_ZH.findall(combined)
+    en_matches = _REASONING_MARKERS_EN.findall(prompt)
+    zh_matches = _REASONING_MARKERS_ZH.findall(prompt)
     matches = list(set(en_matches + zh_matches))
     marker_count = len(matches)
 
