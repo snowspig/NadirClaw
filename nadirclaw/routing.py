@@ -410,7 +410,6 @@ _REASONING_MARKERS_ZH = re.compile(
     r"|设计.*系统"
     r"|设计.*方案"
     r")",
->>>>>>> feature/complex-coding-reasoning
 )
 
 
@@ -761,8 +760,21 @@ def detect_code_review(prompt: str, system_message: str = "") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code role detection
+# Agent role detection — identify AI coding agent session types
+#
+# This feature is opt-in via NADIRCLAW_AGENT_ROLE_DETECTION=true.
+# It detects coding agent session types (planning, explore, subagent)
+# from system prompt markers. Currently tuned for Claude Code;
+# additional agent support welcome via PR.
+#
+# Markers are intentionally matched against system prompts only,
+# not user messages, to avoid false positives from career questions
+# or general discussion about software architecture.
 # ---------------------------------------------------------------------------
+
+# Named constants for session classification thresholds.
+MAIN_SESSION_MIN_CHARS = 15000  # chars — main session has long system prompt
+SHORT_SESSION_MAX_CHARS = 5000  # chars — likely a subagent/background task
 
 _CLAUDE_CODE_PLANNING_MARKERS = re.compile(
     r"(plan\s*mode\s*is\s*active"
@@ -813,6 +825,8 @@ def detect_claude_code_role(
 ) -> Dict[str, Any]:
     """Detect Claude Code agent role from system prompt signals.
 
+    Currently tuned for Claude Code. Opt-in via NADIRCLAW_AGENT_ROLE_DETECTION=true.
+
     Returns {"role": str, "confidence": float, "signals": list[str]}.
     role can be: "planning", "explore", "subagent", "execution", or "unknown".
     """
@@ -842,7 +856,10 @@ def detect_claude_code_role(
         if has_plan_command:
             signals.append("plan_command")
         return {"role": role, "confidence": confidence, "signals": signals}
-        return {"role": role, "confidence": confidence, "signals": signals}
+
+    # Distinguish subagents from main sessions.
+    # Main sessions have long system prompts with extensive instructions.
+    is_main_session = len(system_prompt) > MAIN_SESSION_MIN_CHARS
 
     # Explore agent detection (route to explore model)
     if _CLAUDE_CODE_EXPLORE_MARKERS.search(system_prompt):
@@ -850,20 +867,6 @@ def detect_claude_code_role(
         confidence = 0.95
         signals.append("explore_markers")
         return {"role": role, "confidence": confidence, "signals": signals}
-
-    # ============================================================
-    # CRITICAL FIX: Exclude Claude Code main session from subagent detection
-    # ============================================================
-    # Main session indicators:
-    # 1. "You are Claude Code, Anthropic's official CLI" in system prompt
-    # 2. Large system prompt (>15KB) - main session has extensive instructions
-    #
-    # This prevents the main session from being misclassified as subagent
-    # due to model name mentions like "Haiku 4.5" or "Sonnet 4.5"
-    is_main_session = (
-        "You are Claude Code, Anthropic's official CLI" in system_prompt
-        or len(system_prompt) > 15000
-    )
 
     # Subagent detection (model identity in system prompt)
     # ONLY apply if NOT main session
@@ -875,10 +878,9 @@ def detect_claude_code_role(
 
     # Short system prompt = likely subagent (but lower confidence, don't override execution)
     # Only use this as a tiebreaker when no other detection applies
-    # Also skip if this is main session
-    if not is_main_session and len(system_prompt) < 5000:
+    if not is_main_session and len(system_prompt) < SHORT_SESSION_MAX_CHARS:
         role = "subagent"
-        confidence = 0.50  # Lower confidence - shouldn't override execution (0.70)
+        confidence = 0.60  # Matches the routing threshold for subagent tier
         signals.append("short_system_prompt")
         # Don't return immediately - let other detection take precedence
 
@@ -1140,6 +1142,20 @@ def apply_routing_modifiers(
         last_user_message=last_user_text_for_role,
     )
     routing_info["claude_code_role"] = cc_role
+
+    # --- Agent role detection (opt-in) ---
+    # Detects coding agent session types (planning, explore, subagent).
+    # Disabled by default — enable with NADIRCLAW_AGENT_ROLE_DETECTION=true.
+    from nadirclaw.settings import settings as _settings
+    if _settings.AGENT_ROLE_DETECTION:
+        agent_role = detect_agent_role(
+            system_prompt=system_text,
+            message_count=message_count,
+            tool_names=tool_names,
+        )
+        routing_info["agent_role"] = agent_role
+    else:
+        routing_info["agent_role"] = {"role": "unknown", "confidence": 0.0, "signals": []}
 
     # --- Background security monitor detection (early return) ---
     # These are PreToolUse hook requests (action-guard) that check if agent
