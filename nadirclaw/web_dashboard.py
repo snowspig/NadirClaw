@@ -275,6 +275,7 @@ tr:last-child td { border: none; }
 .model-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; font-size: 0.75rem; color: #9ca3af; }
 .model-stats span { color: #e0e0e0; font-weight: 500; }
 .fallback-tag { color: #f87171; font-size: 0.7rem; }
+.fallback-reason { color: #fbbf24; font-size: 0.65rem; display: block; margin-top: 2px; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 .quota-banner { display: flex; align-items: center; gap: 1rem; padding: 1rem 2rem; background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%); border-bottom: 1px solid #dc2626; }
 .quota-banner .quota-icon { font-size: 1.5rem; }
@@ -464,9 +465,10 @@ async function refresh() {
     for (const r of d.recent_requests) {
       const t = r.time ? new Date(r.time).toLocaleTimeString() : '-';
       const tc = TIER_CLASSES[r.tier] || 'tier-direct';
-      const fb = r.fallback ? ' <span class="fallback-tag" title="' + (r.fallback_reasons||'').replace(/"/g,'&quot;') + '">⚡fallback</span>' : '';
+      const fbTag = r.fallback ? ' <span class="fallback-tag">⚡fallback</span>' : '';
+      const fbReason = (r.fallback && r.fallback_reasons) ? '<span class="fallback-reason" title="' + r.fallback_reasons.replace(/"/g,'&quot;') + '">' + r.fallback_reasons.replace(/</g,'&lt;').substring(0, 80) + '</span>' : '';
       const resp = (r.response || '').replace(/</g,'&lt;').substring(0, 150) || (r.prompt||'').replace(/</g,'&lt;').substring(0, 80);
-      rb.innerHTML += '<tr><td>' + t + '</td><td style="font-size:0.75rem">' + r.model + fb + '</td><td><span class="tier-badge ' + tc + '">' + r.tier + '</span></td><td>' + (r.latency_ms||0) + 'ms</td><td>' + r.tokens + '</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + resp + '</td></tr>';
+      rb.innerHTML += '<tr><td>' + t + '</td><td style="font-size:0.75rem">' + r.model + fbTag + fbReason + '</td><td><span class="tier-badge ' + tc + '">' + r.tier + '</span></td><td>' + (r.latency_ms||0) + 'ms</td><td>' + r.tokens + '</td><td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + resp + '</td></tr>';
     }
 
     // Compression toggle and stats
