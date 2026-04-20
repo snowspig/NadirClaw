@@ -129,7 +129,10 @@ async def call_anthropic_direct(
         headers["anthropic-beta"] = beta
 
     logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    # Short connect timeout (5s) to fail fast on network issues;
+    # long read timeout for large model responses.
+    client_timeout = httpx.Timeout(timeout, connect=5.0)
+    async with httpx.AsyncClient(timeout=client_timeout) as client:
         resp = await client.post(url, headers=headers, json=ant_body)
 
     if resp.status_code >= 400:
