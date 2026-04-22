@@ -19,6 +19,7 @@ the upstream model, then emits Anthropic SSE events.
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import time
 import uuid
@@ -56,14 +57,23 @@ def get_anthropic_compat_endpoint(
 ) -> Optional[Tuple[str, str]]:
     """Return (api_base, api_key) if the provider has an Anthropic-compatible endpoint.
 
-    Reads from Settings (loaded once at import time) instead of hitting .env on every call.
+    Reads from .env file first (via dotenv_values) to bypass process environment
+    overrides — e.g. Claude Code injects ANTHROPIC_API_KEY=local into the shell,
+    which would shadow the real key in the .env file.
+    Falls back to os.getenv for any key not present in the file.
     """
     if provider not in _ANTHROPIC_COMPAT_PROVIDERS:
         return None
     base_env, key_env = _ANTHROPIC_COMPAT_PROVIDERS[provider]
 
-    api_base = getattr(settings, base_env, "") or os.getenv(base_env, "")
-    api_key = getattr(settings, key_env, "") or os.getenv(key_env, "")
+    # Read from .env file first — file values take priority over process env
+    # to avoid Claude Code's ANTHROPIC_API_KEY=local override.
+    from dotenv import dotenv_values
+    _env_file = Path.home() / ".nadirclaw" / ".env"
+    file_vals = dotenv_values(_env_file) if _env_file.exists() else {}
+
+    api_base = file_vals.get(base_env, "") or os.getenv(base_env, "")
+    api_key = file_vals.get(key_env, "") or os.getenv(key_env, "")
 
     if api_key in ("local", "dummy", "sk-placeholder", ""):
         return None
