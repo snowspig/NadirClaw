@@ -1215,54 +1215,67 @@ async def anthropic_messages(raw_request: Request):
                     # Do NOT use _call_with_fallback here; it has its own
                     # internal chain that would consume all LiteLLM candidates
                     # and bypass the outer loop's direct-Anthropic path.
-                    logger.info(
-                        "LiteLLM call for %s (provider=%s)",
-                        candidate_model, candidate_provider,
-                    )
-                    response_data = await _dispatch_model(
-                        candidate_model, request, candidate_provider,
-                    )
-                    final_model = candidate_model
-                    if final_model != selected_model:
-                        fallback_from = selected_model
-                    # response_data is in OpenAI format — convert to Anthropic for return
-                    elapsed_ms = int((time.time() - start_time) * 1000)
-                    stats = {
-                        "prompt_tokens": response_data.get("prompt_tokens", 0),
-                        "completion_tokens": response_data.get("completion_tokens", 0),
-                    }
-                    record_llm_call(
-                        span, model=final_model, provider=candidate_provider,
-                        prompt_tokens=stats["prompt_tokens"],
-                        completion_tokens=stats["completion_tokens"],
-                        tier=tier, latency_ms=elapsed_ms,
-                    )
-                    _log_request({
-                        "type": "anthropic_messages",
-                        "request_id": request_id,
-                        "prompt": display_prompt,
-                        "response": _clean_display_text(response_data.get("content") or "")[:500],
-                        "selected_model": final_model,
-                        "tier": tier,
-                        "fallback_used": fallback_from,
-                        "fallback_reasons": fallback_reasons or None,
-                        "total_latency_ms": elapsed_ms,
-                        **stats,
-                        "status": "ok",
-                        "call_path": "litellm_fallback",
-                        **req_meta,
-                    })
-                    display_model = body.get("model", "") or final_model
-                    if ant_stream:
-                        return _build_anthropic_streaming_response(
-                            request_id, display_model, response_data,
+                    try:
+                        logger.info(
+                            "LiteLLM call for %s (provider=%s)",
+                            candidate_model, candidate_provider,
                         )
-                    return JSONResponse(
-                        content=openai_response_to_anthropic(
-                            response_data, display_model, request_id,
-                        ),
-                        headers={"content-type": "application/json"},
-                    )
+                        response_data = await _dispatch_model(
+                            candidate_model, request, candidate_provider,
+                        )
+                        final_model = candidate_model
+                        if final_model != selected_model:
+                            fallback_from = selected_model
+                        # response_data is in OpenAI format — convert to Anthropic for return
+                        elapsed_ms = int((time.time() - start_time) * 1000)
+                        stats = {
+                            "prompt_tokens": response_data.get("prompt_tokens", 0),
+                            "completion_tokens": response_data.get("completion_tokens", 0),
+                        }
+                        record_llm_call(
+                            span, model=final_model, provider=candidate_provider,
+                            prompt_tokens=stats["prompt_tokens"],
+                            completion_tokens=stats["completion_tokens"],
+                            tier=tier, latency_ms=elapsed_ms,
+                        )
+                        _log_request({
+                            "type": "anthropic_messages",
+                            "request_id": request_id,
+                            "prompt": display_prompt,
+                            "response": _clean_display_text(response_data.get("content") or "")[:500],
+                            "selected_model": final_model,
+                            "tier": tier,
+                            "fallback_used": fallback_from,
+                            "fallback_reasons": fallback_reasons or None,
+                            "total_latency_ms": elapsed_ms,
+                            **stats,
+                            "status": "ok",
+                            "call_path": "litellm_fallback",
+                            **req_meta,
+                        })
+                        display_model = body.get("model", "") or final_model
+                        if ant_stream:
+                            return _build_anthropic_streaming_response(
+                                request_id, display_model, response_data,
+                            )
+                        return JSONResponse(
+                            content=openai_response_to_anthropic(
+                                response_data, display_model, request_id,
+                            ),
+                            headers={"content-type": "application/json"},
+                        )
+                    except Exception as e:
+                        err_msg = str(e)[:200]
+                        logger.warning(
+                            "LiteLLM call failed for %s: %s — trying next",
+                            candidate_model, err_msg,
+                        )
+                        fallback_reasons.append({
+                            "model": candidate_model,
+                            "reason": err_msg,
+                            "path": "litellm",
+                        })
+                        continue
 
             if raw_response is None:
                 raise RuntimeError(f"All models failed in fallback chain for tier={tier}")
