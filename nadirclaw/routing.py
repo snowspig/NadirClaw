@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("nadirclaw.routing")
 
+_CLAUDE_CODE_MAIN_SESSION_MARKER = "You are Claude Code, Anthropic's official CLI"
+
 # ---------------------------------------------------------------------------
 # Model Pool — weighted load balancing across multiple models
 # ---------------------------------------------------------------------------
@@ -32,7 +34,7 @@ def _parse_model_pools() -> Tuple[Dict[str, List[Tuple[str, int]]], Dict[str, st
     """Parse NADIRCLAW_MODEL_POOLS env var into pool + reverse-map.
 
     Format: "pool_name=model1,weight1+model2,weight2;pool_name2=..."
-    Example: "turbo=glm-5-turbo,10+kimi-K2.6-code-preview,9+minimax-MiniMax-M2.7,3"
+    Example: "turbo=glm-5-turbo,10+kimi-for-coding,9+minimax-MiniMax-M2.7,3"
     """
     raw = os.getenv("NADIRCLAW_MODEL_POOLS", "")
     if not raw:
@@ -133,16 +135,18 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "gemini-2.5-flash": {"context_window": 1_000_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": True},
     "gemini/gemini-3-flash-preview": {"context_window": 1_000_000, "cost_per_m_input": 0.50, "cost_per_m_output": 3.00, "has_vision": True},
     "gemini/gemini-2.5-pro": {"context_window": 1_000_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
-    # OpenAI
-    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
-    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 0.40, "cost_per_m_output": 1.60, "has_vision": True},
-    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 0.10, "cost_per_m_output": 0.40, "has_vision": True},
+    # OpenAI — GPT-4.x series
+    "gpt-4.1": {"context_window": 1_047_576, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
+    "gpt-4.1-mini": {"context_window": 1_047_576, "cost_per_m_input": 0.40, "cost_per_m_output": 1.60, "has_vision": True},
+    "gpt-4.1-nano": {"context_window": 1_047_576, "cost_per_m_input": 0.10, "cost_per_m_output": 0.40, "has_vision": True},
+    "gpt-4o": {"context_window": 128_000, "cost_per_m_input": 2.50, "cost_per_m_output": 10.00, "has_vision": True},
+    "gpt-4o-mini": {"context_window": 128_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": True},
+    # OpenAI — GPT-5.x series
     "gpt-5": {"context_window": 400_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
     "gpt-5-mini": {"context_window": 400_000, "cost_per_m_input": 0.25, "cost_per_m_output": 2.00, "has_vision": True},
     "gpt-5.1": {"context_window": 400_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
     "gpt-5.2": {"context_window": 400_000, "cost_per_m_input": 1.75, "cost_per_m_output": 14.00, "has_vision": True},
-    "gpt-5.4": {"context_window": 128_000, "cost_per_m_input": 2.50, "cost_per_m_output": 10.00, "has_vision": True},
-    "gpt-5.4": {"context_window": 128_000, "cost_per_m_input": 0.15, "cost_per_m_output": 0.60, "has_vision": True},
+    "gpt-5.4": {"context_window": 1_047_576, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
     "o3": {"context_window": 200_000, "cost_per_m_input": 2.00, "cost_per_m_output": 8.00, "has_vision": True},
     "o3-mini": {"context_window": 200_000, "cost_per_m_input": 1.10, "cost_per_m_output": 4.40, "has_vision": True},
     "o4-mini": {"context_window": 200_000, "cost_per_m_input": 1.10, "cost_per_m_output": 4.40, "has_vision": True},
@@ -171,7 +175,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "minimax-MiniMax-M2.7": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
     "minimax-MiniMax-M2.5": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
     # Kimi
-    "kimi-K2.6-code-preview": {"context_window": 200_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": False},
+    "kimi-for-coding": {"context_window": 256_000, "cost_per_m_input": 0.10, "cost_per_m_output": 0.10, "has_vision": True},
     # Gemini 3.1 Pro (long context)
     "gemini-3.1-pro": {"context_window": 2_000_000, "cost_per_m_input": 1.25, "cost_per_m_output": 10.00, "has_vision": True},
 }
@@ -186,15 +190,9 @@ MODEL_ALIASES: Dict[str, str] = {
     "haiku": "claude-haiku-4-5-20251001",
     "claude": "claude-sonnet-4-6",
     "claude-opus-4-6": "claude-opus-4-6-20250918",
-    "claude-sonnet-4-6": "claude-sonnet-4-6",
-    "gpt-5.4": "gpt-5.4",
     "gpt5.4": "gpt-5.4",
-    "gpt-5.4": "gpt-5.4",
     "gpt5": "gpt-5.2",
     "gpt5-mini": "gpt-5-mini",
-    "o3": "o3",
-    "o3-mini": "o3-mini",
-    "o4-mini": "o4-mini",
     "flash": "gemini-2.5-flash",
     "gemini-flash": "gemini-2.5-flash",
     "gemini-pro": "gemini-2.5-pro",
@@ -204,7 +202,7 @@ MODEL_ALIASES: Dict[str, str] = {
     "glm": "glm-5",
     "glm5": "glm-5",
     "minimax": "minimax-MiniMax-M2.7",
-    "kimi": "kimi-K2.6-code-preview",
+    "kimi": "kimi-for-coding",
 }
 
 # ---------------------------------------------------------------------------
@@ -279,14 +277,6 @@ def detect_agentic(
     score = 0.0
     signals: List[str] = []
 
-    # Tool definitions present - DISABLED for Claude Code (always 200+ tools)
-    # if has_tools and tool_count >= 1:
-    #     score += 0.35
-    #     signals.append(f"tools_defined({tool_count})")
-    # if tool_count >= 4:
-    #     score += 0.15
-    #     signals.append("many_tools")
-
     # Tool-role messages in conversation (active agentic loop)
     # Higher threshold for Claude Code: need 3+ tool messages for strong signal
     tool_msgs = sum(1 for m in messages if getattr(m, "role", None) == "tool")
@@ -306,16 +296,6 @@ def detect_agentic(
     elif cycles >= 2:
         score += 0.30
         signals.append(f"agentic_cycles({cycles})")
-
-    # Long system prompt - DISABLED for Claude Code (always 15KB+)
-    # if system_prompt_length > 500:
-    #     score += 0.10
-    #     signals.append("long_system_prompt")
-
-    # System prompt keywords - DISABLED for Claude Code (always present)
-    # if system_prompt and _AGENTIC_SYSTEM_KEYWORDS.search(system_prompt):
-    #     score += 0.20
-    #     signals.append("agentic_keywords")
 
     # Many messages (deep conversation / multi-turn loop)
     # Higher thresholds for Claude Code's longer sessions
@@ -391,24 +371,24 @@ _REASONING_MARKERS_ZH = re.compile(
     r"|逻辑推理"
     r"|证明\s+(?:以下|这个)"
     r"|推导\s+(?:公式|结论)"
-    r"|分析.*利弊"
-    r"|权衡.*优劣"
-    r"|权衡.*利弊"
+    r"|分析.{0,40}利弊"
+    r"|权衡.{0,40}优劣"
+    r"|权衡.{0,40}利弊"
     r"|对比分析"
-    r"|比较.*差异"
+    r"|比较.{0,40}差异"
     r"|优缺点"
     r"|批判性分析"
     r"|证明以下"
     r"|证明这个"
     r"|推导公式"
     r"|推导结论"
-    r"|详细解释.*原因"
+    r"|详细解释.{0,40}原因"
     r"|论证以下"
     r"|论证这个"
     r"|演绎推理"
     r"|归纳推理"
-    r"|设计.*系统"
-    r"|设计.*方案"
+    r"|设计.{0,40}系统"
+    r"|设计.{0,40}方案"
     r")",
 )
 
@@ -432,11 +412,11 @@ def detect_reasoning(prompt: str, system_message: str = "") -> Dict[str, Any]:
     Uses separate regexes for English (with \\b word boundaries) and Chinese
     (without \\b, since CJK characters have no word boundaries).
 
-    Only checks the user prompt, NOT the system message.
+    Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
+
+    NOTE: Only checks the user prompt, NOT the system message.
     System messages in Claude Code contain many reasoning-related instructions
     that would cause false positives for every request.
-
-    Returns {"is_reasoning": bool, "marker_count": int, "markers": list[str]}.
     """
     en_matches = _REASONING_MARKERS_EN.findall(prompt)
     zh_matches = _REASONING_MARKERS_ZH.findall(prompt)
@@ -744,7 +724,7 @@ def detect_code_review(prompt: str, system_message: str = "") -> Dict[str, Any]:
     ]
 
     for pattern in review_context_signals:
-        if re.search(pattern, text_to_check, re.IGNORECASE):
+        if re.search(pattern, text, re.IGNORECASE):
             confidence = max(confidence, 0.85)
             signals.append("review_context")
             break
@@ -1191,7 +1171,7 @@ def apply_routing_modifiers(
     # 200+ tools and long conversations, so agentic detection is meaningless.
     # Let complex_coding / code_review / reasoning handle upgrades instead.
     is_main_session = (
-        "You are Claude Code, Anthropic's official CLI" in system_text
+        _CLAUDE_CODE_MAIN_SESSION_MARKER in system_text
         or request_meta.get("system_prompt_length", 0) > 15000
     )
 
@@ -1314,7 +1294,7 @@ def apply_routing_modifiers(
     # Priority: reasoning > review > complex > execution > subagent
     code_review = detect_code_review(
         prompt=last_user_text_clean,
-        last_user_text=last_user_text_clean,
+        system_message=system_text,
     )
     routing_info["code_review"] = code_review
 

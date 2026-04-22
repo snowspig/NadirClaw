@@ -76,6 +76,38 @@ class Settings:
         return os.getenv("NADIRCLAW_API_BASE", "")
 
     @property
+    def ZAI_API_BASE(self) -> str:
+        return os.getenv("ZAI_API_BASE", "")
+
+    @property
+    def ZAI_API_KEY(self) -> str:
+        return os.getenv("ZAI_API_KEY", "")
+
+    @property
+    def KIMI_API_BASE(self) -> str:
+        return os.getenv("KIMI_API_BASE", "")
+
+    @property
+    def KIMI_API_KEY(self) -> str:
+        return os.getenv("KIMI_API_KEY", "")
+
+    @property
+    def MINIMAX_API_BASE(self) -> str:
+        return os.getenv("MINIMAX_API_BASE", "")
+
+    @property
+    def MINIMAX_API_KEY(self) -> str:
+        return os.getenv("MINIMAX_API_KEY", "")
+
+    @property
+    def HOSTED_VLLM_API_BASE(self) -> str:
+        return os.getenv("HOSTED_VLLM_API_BASE", "http://localhost:8000/v1")
+
+    @property
+    def HOSTED_VLLM_API_KEY(self) -> str:
+        return os.getenv("HOSTED_VLLM_API_KEY", "none")
+
+    @property
     def CONFIDENCE_THRESHOLD(self) -> float:
         return float(os.getenv("NADIRCLAW_CONFIDENCE_THRESHOLD", "0.06"))
 
@@ -83,37 +115,6 @@ class Settings:
     def MID_MODEL(self) -> str:
         """Model for mid-complexity prompts. Falls back to SIMPLE_MODEL."""
         return os.getenv("NADIRCLAW_MID_MODEL", "") or self.SIMPLE_MODEL
-
-    @property
-    def TIER_THRESHOLDS(self) -> tuple[float, float]:
-        """Score thresholds for 3-tier routing: (simple_max, complex_min).
-
-        Prompts with score <= simple_max → simple tier.
-        Prompts with score >= complex_min → complex tier.
-        Prompts in between → mid tier.
-
-        Set NADIRCLAW_TIER_THRESHOLDS=0.35,0.65 to customize.
-        Default: (0.35, 0.65).
-        """
-        raw = os.getenv("NADIRCLAW_TIER_THRESHOLDS", "")
-        if raw:
-            parts = [p.strip() for p in raw.split(",")]
-            if len(parts) == 2:
-                try:
-                    return (float(parts[0]), float(parts[1]))
-                except ValueError:
-                    _settings_logger.warning(
-                        "Invalid NADIRCLAW_TIER_THRESHOLDS=%r — expected two floats "
-                        "(e.g. '0.35,0.65'). Falling back to defaults.",
-                        raw,
-                    )
-            else:
-                _settings_logger.warning(
-                    "Invalid NADIRCLAW_TIER_THRESHOLDS=%r — expected two comma-separated "
-                    "values. Falling back to defaults.",
-                    raw,
-                )
-        return (0.35, 0.65)
 
     @property
     def has_mid_tier(self) -> bool:
@@ -156,19 +157,6 @@ class Settings:
     @property
     def OPTIMIZE_MAX_TURNS(self) -> int:
         return int(os.getenv("NADIRCLAW_OPTIMIZE_MAX_TURNS", "20"))
-
-    @property
-    def CONTEXT_COMPRESSION(self) -> str:
-        """Context compression mode. Default: 'false'."""
-        return os.getenv("NADIRCLAW_CONTEXT_COMPRESSION", "false")
-
-    @property
-    def MID_MODEL(self) -> str:
-        return os.getenv("NADIRCLAW_MID_MODEL", "") or self.SIMPLE_MODEL
-
-    @property
-    def has_mid_tier(self) -> bool:
-        return bool(os.getenv("NADIRCLAW_MID_MODEL", ""))
 
     @property
     def REASONING_MODEL(self) -> str:
@@ -318,6 +306,7 @@ class Settings:
             self.MID_MODEL,
             self.SONNET_MODEL,
             self.REASONING_MODEL,
+            self.REVIEW_MODEL,
             self.FREE_MODEL,
         ] + self.FALLBACK_CHAIN
         for m in all_models:
@@ -355,6 +344,21 @@ class Settings:
     def COMPRESS_TOOL_OUTPUT_MAX(self) -> int:
         """Max characters for truncated tool output."""
         return int(os.getenv("NADIRCLAW_COMPRESS_TOOL_MAX", "500"))
+
+    @property
+    def COMPRESS_VLLM_SUMMARY(self) -> bool:
+        """Use vLLM to summarize old messages instead of truncating."""
+        return os.getenv("NADIRCLAW_COMPRESS_VLLM_SUMMARY", "false").lower() in ("true", "1", "yes")
+
+    @property
+    def COMPRESS_VLLM_URL(self) -> str:
+        """vLLM endpoint for context summarization."""
+        return os.getenv("NADIRCLAW_COMPRESS_VLLM_URL", "http://localhost:8000/v1/chat/completions")
+
+    @property
+    def COMPRESS_VLLM_MODEL(self) -> str:
+        """Model name for vLLM summarization."""
+        return os.getenv("NADIRCLAW_COMPRESS_VLLM_MODEL", "Qwopus3.5-27B-v3")
 
     @property
     def AGENT_ROLE_DETECTION(self) -> bool:

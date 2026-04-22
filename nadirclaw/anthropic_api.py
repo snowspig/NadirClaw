@@ -56,23 +56,15 @@ def get_anthropic_compat_endpoint(
 ) -> Optional[Tuple[str, str]]:
     """Return (api_base, api_key) if the provider has an Anthropic-compatible endpoint.
 
-    Reads credentials from .env file directly to avoid override by process
-    environment variables (e.g., Claude Code injects ANTHROPIC_API_KEY=local).
+    Reads from Settings (loaded once at import time) instead of hitting .env on every call.
     """
     if provider not in _ANTHROPIC_COMPAT_PROVIDERS:
         return None
     base_env, key_env = _ANTHROPIC_COMPAT_PROVIDERS[provider]
 
-    # Read from .env file first (avoids process env overrides like "local")
-    from dotenv import dotenv_values
-    from pathlib import Path
-    _env_file = Path.home() / ".nadirclaw" / ".env"
-    file_vals = dotenv_values(_env_file) if _env_file.exists() else {}
+    api_base = getattr(settings, base_env, "") or os.getenv(base_env, "")
+    api_key = getattr(settings, key_env, "") or os.getenv(key_env, "")
 
-    api_base = file_vals.get(base_env, "") or os.getenv(base_env, "")
-    api_key = file_vals.get(key_env, "") or os.getenv(key_env, "")
-
-    # Sanity check: if api_key looks like a placeholder, skip direct path
     if api_key in ("local", "dummy", "sk-placeholder", ""):
         return None
 
@@ -82,11 +74,101 @@ def get_anthropic_compat_endpoint(
     return api_base, api_key
 
 
+# Anthropic built-in tools that need conversion for other providers
+_BUILTIN_TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
+    "web_search": {
+        "name": "web_search",
+        "description": "Search the web for up-to-date information. Returns search results with titles, URLs, and snippets.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+            },
+            "required": ["query"],
+        },
+    },
+    "computer": {
+        "name": "computer",
+        "description": "Control a computer screen (click, type, screenshot, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action to perform"},
+                "coordinate": {"type": "array", "items": {"type": "integer"}, "description": "x, y coordinates"},
+                "text": {"type": "string", "description": "Text to type"},
+            },
+            "required": ["action"],
+        },
+    },
+    "str_replace_based_edit": {
+        "name": "str_replace_based_edit",
+        "description": "Edit a file by replacing text. Commands: view, create, str_replace, insert.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Command: view, create, str_replace, insert"},
+                "path": {"type": "string", "description": "File path"},
+                "file_text": {"type": "string", "description": "Full file content for create"},
+                "old_str": {"type": "string", "description": "Text to replace"},
+                "new_str": {"type": "string", "description": "Replacement text"},
+                "insert_line": {"type": "integer", "description": "Line number for insert"},
+                "new_str_to_insert": {"type": "string", "description": "Text to insert"},
+            },
+            "required": ["command", "path"],
+        },
+    },
+}
+
+
+def _convert_builtin_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Anthropic built-in tools to standard function tools.
+
+    Anthropic built-in tools like web_search use special types
+    (e.g. "web_search_20250305") that non-Anthropic providers don't understand.
+    Convert them to standard function tools so GLM/Kimi/MiniMax can call them.
+    """
+    tool_type = tool.get("type", "")
+
+    # Already a standard function tool
+    if tool_type in ("", "function", "custom"):
+        return tool
+
+    # Check if it's a known built-in tool
+    tool_name = tool.get("name", "")
+    if tool_name in _BUILTIN_TOOL_SCHEMAS:
+        converted = {
+            "type": "custom",
+            "name": tool_name,
+            **_BUILTIN_TOOL_SCHEMAS[tool_name],
+        }
+        logger.debug("Converted built-in tool: %s (%s → custom)", tool_name, tool_type)
+        return converted
+
+    # Unknown built-in tool — convert to generic function tool
+    if "_" in tool_type or tool_type not in ("", "function", "custom"):
+        converted = {
+            "type": "custom",
+            "name": tool_name,
+            "description": f"Built-in tool: {tool_name}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string", "description": f"Input for {tool_name}"},
+                },
+            },
+        }
+        logger.debug("Converted unknown built-in tool: %s (%s → custom)", tool_name, tool_type)
+        return converted
+
+    return tool
+
+
 async def call_anthropic_direct(
     api_base: str,
     api_key: str,
     model: str,
     body: Dict[str, Any],
+    provider: Optional[str] = None,
     timeout: float = 600.0,
 ) -> Dict[str, Any]:
     """Call an Anthropic-compatible endpoint directly, no format conversion.
@@ -95,16 +177,28 @@ async def call_anthropic_direct(
     raw Anthropic response.  This avoids the Anthropic→OpenAI→Anthropic
     double-conversion that can cause format issues on some providers.
     """
+    from nadirclaw import minimax_recorder
+
     url = f"{api_base}/v1/messages"
+
+    # Open MiniMax trace context (no-op for non-MiniMax or when disabled)
+    trace_ctx = minimax_recorder.begin_turn(
+        provider=provider or "",
+        model=model,
+        body=body,
+    )
 
     # Build the Anthropic request body from the original
     ant_body: Dict[str, Any] = {"model": model, "max_tokens": body.get("max_tokens", 4096)}
     if body.get("messages"):
-        ant_body["messages"] = body["messages"]
+        ant_body["messages"] = _sanitize_messages(body["messages"])
     if body.get("system"):
         ant_body["system"] = body["system"]
     if body.get("tools"):
-        ant_body["tools"] = body["tools"]
+        tools = body["tools"]
+        if provider and provider != "anthropic":
+            tools = [_convert_builtin_tool(t) for t in tools]
+        ant_body["tools"] = tools
     if body.get("tool_choice"):
         ant_body["tool_choice"] = body["tool_choice"]
     if body.get("thinking"):
@@ -129,16 +223,30 @@ async def call_anthropic_direct(
         headers["anthropic-beta"] = beta
 
     logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
+    # Debug dump: log request body to file for analysis
+    import pathlib
+    _dump_path = pathlib.Path.home() / ".nadirclaw" / "debug_last_request.json"
+    _dump_path.write_text(json.dumps(ant_body, default=str, ensure_ascii=False)[:100000])
     # Short connect timeout (5s) to fail fast on network issues;
     # long read timeout for large model responses.
     client_timeout = httpx.Timeout(timeout, connect=5.0)
-    async with httpx.AsyncClient(timeout=client_timeout) as client:
-        resp = await client.post(url, headers=headers, json=ant_body)
+
+    try:
+        async with httpx.AsyncClient(timeout=client_timeout) as client:
+            resp = await client.post(url, headers=headers, json=ant_body)
+    except Exception as exc:
+        minimax_recorder.end_turn(trace_ctx, raw_response={}, error=str(exc))
+        raise
 
     if resp.status_code >= 400:
         error_text = resp.text[:500]
         logger.warning(
             "Direct Anthropic call failed (%s): %s", resp.status_code, error_text,
+        )
+        minimax_recorder.end_turn(
+            trace_ctx,
+            raw_response={"status_code": resp.status_code},
+            error=error_text,
         )
         from litellm.exceptions import (
             AuthenticationError as LiteLLMAuthError,
@@ -162,7 +270,9 @@ async def call_anthropic_direct(
             message=error_text, model=model, llm_provider="anthropic",
         )
 
-    return resp.json()
+    raw_json = resp.json()
+    minimax_recorder.end_turn(trace_ctx, raw_response=raw_json, error=None)
+    return raw_json
 
 
 # Pattern to strip system-reminder tags from display text.
@@ -181,6 +291,45 @@ def _clean_display_text(text: str) -> str:
         return text
     cleaned = _SYSTEM_REMINDER_RE.sub("", text).strip()
     return cleaned if cleaned else ""
+
+
+def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fix known provider quirks for Anthropic-compatible endpoints.
+
+    - ZAI/GLM: tool_result needs 'id' field (SDK bug: ClaudeContentBlockToolResult.id)
+    - ZAI/GLM: tool_use.input must be a dict
+    """
+    import copy
+    msgs = copy.deepcopy(messages)
+    tr_fixed = 0
+    tu_fixed = 0
+    for msg in msgs:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            # ZAI bug: tool_result needs an 'id' field
+            if block.get("type") == "tool_result" and "id" not in block:
+                block["id"] = f"toolr_{block.get('tool_use_id', 'unknown')}"
+                tr_fixed += 1
+            # Ensure tool_use.input is a dict
+            if block.get("type") == "tool_use":
+                if "id" not in block:
+                    import hashlib
+                    h = hashlib.md5(
+                        f"{block.get('name','')}:{block.get('input','')}".encode()
+                    ).hexdigest()[:24]
+                    block["id"] = f"toolu_{h}"
+                    tu_fixed += 1
+                inp = block.get("input")
+                if not isinstance(inp, dict):
+                    block["input"] = {"value": inp} if inp is not None else {}
+                    tu_fixed += 1
+    if tr_fixed or tu_fixed:
+        logger.info("_sanitize: tool_result id fixed=%d, tool_use fixed=%d", tr_fixed, tu_fixed)
+    return msgs
 
 
 def anthropic_response_to_stats(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -636,7 +785,7 @@ def _extract_display_prompt(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
-def _extract_response_text(data: Dict[str, Any]) -> str:
+def _format_response_for_log(data: Dict[str, Any]) -> str:
     """Extract text from an Anthropic response for log display."""
     parts = []
     for block in data.get("content", []):
@@ -775,6 +924,11 @@ async def anthropic_messages(raw_request: Request):
     - Path B (non-Anthropic): Convert to OpenAI format, call through LiteLLM.
 
     Both paths share the same routing pipeline for model selection.
+
+    NOTE: Internally, all calls are made with stream=False (non-streaming). The
+    upstream provider returns the complete response, which is then wrapped into
+    Anthropic SSE events for fake streaming when the client requested stream=True.
+    This avoids the complexity of real streaming through format conversion layers.
     """
     from nadirclaw.server import (
         _call_with_fallback,
@@ -980,6 +1134,11 @@ async def anthropic_messages(raw_request: Request):
                 logger.info("Pool %s: %s → %s", pool_name, selected_model, pool_model)
                 selected_model = pool_model
 
+    # --- Dedup-only compression for old messages ---
+    if settings.CONTEXT_COMPRESSION and len(body.get("messages", [])) > settings.COMPRESS_MIN_MESSAGES:
+        from nadirclaw.compress import dedup_old_messages
+        body["messages"] = dedup_old_messages(body["messages"])
+
     # Call model — two paths based on provider type
     from nadirclaw.credentials import detect_provider
     provider = detect_provider(selected_model)
@@ -1001,22 +1160,20 @@ async def anthropic_messages(raw_request: Request):
             final_model = selected_model
 
             # Build candidate list: primary + fallback chain
-            # When tools are present, prefer direct-Anthropic candidates (better
-            # tool-call schema adherence) over LiteLLM candidates like gpt-5.4
-            # which may mangle parameter names (e.g., taskId vs task_id).
-            has_tools = bool(openai_tools)
-            candidates = [selected_model] + fallback_chain
-            if has_tools:
-                anthropic_candidates = []
-                litellm_candidates = []
-                for c in candidates:
-                    cp = detect_provider(c)
-                    ce = get_anthropic_compat_endpoint(cp) if cp else None
-                    if ce:
-                        anthropic_candidates.append(c)
-                    else:
-                        litellm_candidates.append(c)
-                candidates = anthropic_candidates + litellm_candidates
+            # Resolve pool members once, deduplicate to avoid cascade
+            candidates = [selected_model]
+            seen = {selected_model}
+            for c in fallback_chain:
+                pool_name = get_pool_for_model(c)
+                if pool_name:
+                    pool_model = select_from_pool(pool_name)
+                    if pool_model and pool_model not in seen:
+                        logger.info("Pool fallback %s: %s → %s", pool_name, c, pool_model)
+                        candidates.append(pool_model)
+                        seen.add(pool_model)
+                elif c not in seen:
+                    candidates.append(c)
+                    seen.add(c)
 
             for candidate_model in candidates:
                 candidate_provider = detect_provider(candidate_model)
@@ -1034,6 +1191,7 @@ async def anthropic_messages(raw_request: Request):
                             api_key=api_key,
                             model=candidate_model,
                             body=body,
+                            provider=candidate_provider,
                         )
                         final_model = candidate_model
                         if candidate_model != selected_model:
@@ -1083,7 +1241,7 @@ async def anthropic_messages(raw_request: Request):
                         "type": "anthropic_messages",
                         "request_id": request_id,
                         "prompt": display_prompt,
-                        "response": _clean_display_text(response_data.get("content", ""))[:500],
+                        "response": _clean_display_text(response_data.get("content") or "")[:500],
                         "selected_model": final_model,
                         "tier": tier,
                         "fallback_used": fallback_from,
@@ -1134,7 +1292,7 @@ async def anthropic_messages(raw_request: Request):
                 "type": "anthropic_messages",
                 "request_id": request_id,
                 "prompt": display_prompt,
-                "response": _extract_response_text(raw_response),
+                "response": _format_response_for_log(raw_response),
                 "selected_model": final_model,
                 "tier": tier,
                 "fallback_used": fallback_from,
