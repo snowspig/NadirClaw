@@ -65,7 +65,53 @@ def print_summary(records: list[dict]) -> None:
         print(f"{i:>3} {ts:19} {method:6} {path:28} {status:>6} {model:24} {ttfb:>7} {total:>7} {stream:6}")
 
 
-def print_full(records: list[dict]) -> None:
+def _extract_turns(parsed_body: dict) -> list[tuple[str, str]]:
+    """Flatten an Anthropic /v1/messages body into [(role, text), ...].
+
+    Concatenates text blocks per message; surfaces tool_use / tool_result
+    as structured one-liners so they don't get lost.
+    """
+    out: list[tuple[str, str]] = []
+    system = parsed_body.get("system")
+    if isinstance(system, str) and system:
+        out.append(("system", system))
+    elif isinstance(system, list):
+        chunks = [s.get("text", "") for s in system if isinstance(s, dict)]
+        joined = "\n".join(c for c in chunks if c)
+        if joined:
+            out.append(("system", joined))
+    for m in parsed_body.get("messages") or []:
+        role = m.get("role", "?")
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append((role, c))
+        elif isinstance(c, list):
+            parts: list[str] = []
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text":
+                    parts.append(b.get("text", "") or "")
+                elif t == "tool_use":
+                    name = b.get("name", "?")
+                    inp = json.dumps(b.get("input", {}), ensure_ascii=False)[:400]
+                    parts.append(f"[tool_use {name}({inp})]")
+                elif t == "tool_result":
+                    tc = b.get("content")
+                    if isinstance(tc, list):
+                        tc = "\n".join(
+                            (x.get("text", "") or "") for x in tc if isinstance(x, dict)
+                        )
+                    tc = str(tc)[:400]
+                    parts.append(f"[tool_result {b.get('tool_use_id','?')}: {tc}]")
+                elif t == "image":
+                    parts.append("[image]")
+            out.append((role, "\n".join(p for p in parts if p)))
+    return out
+
+
+def print_full(records: list[dict], show_prompts: bool = False) -> None:
     for i, r in enumerate(records, 1):
         req = r.get("request") or {}
         resp = r.get("response") or {}
@@ -95,16 +141,55 @@ def print_full(records: list[dict]) -> None:
                 print(f"    first_user: {_short(ms['first_user_excerpt'], 200)}")
             if ms.get("last_user_excerpt"):
                 print(f"    last_user:  {_short(ms['last_user_excerpt'], 200)}")
+        # full prompt dump when available (--full-body captures)
+        if show_prompts:
+            parsed = body.get("body")
+            if isinstance(parsed, dict):
+                turns = _extract_turns(parsed)
+                if turns:
+                    print("  --- full prompt ---")
+                    for role, text in turns:
+                        print(f"  [{role}]")
+                        for line in text.splitlines() or [""]:
+                            print(f"    {line}")
+            elif body.get("raw_body"):
+                print("  --- raw request body ---")
+                for line in body["raw_body"].splitlines():
+                    print(f"    {line}")
         rbody = resp.get("body")
         if rbody:
             print(f"  response body: {rbody.get('format')} bytes={rbody.get('byte_size')}"
                   f" stop_reason={rbody.get('stop_reason')}")
             if rbody.get("text_excerpt"):
                 print(f"    text: {_short(rbody['text_excerpt'], 200)}")
+            if show_prompts and rbody.get("excerpt"):
+                # error bodies land here (non-JSON 429 pages, etc.)
+                print("  --- response excerpt ---")
+                for line in rbody["excerpt"].splitlines():
+                    print(f"    {line}")
+            if show_prompts and isinstance(rbody.get("body"), dict):
+                content = rbody["body"].get("content")
+                if isinstance(content, list):
+                    print("  --- response content ---")
+                    for b in content:
+                        if not isinstance(b, dict):
+                            continue
+                        t = b.get("type")
+                        if t == "text":
+                            for line in (b.get("text") or "").splitlines():
+                                print(f"    {line}")
+                        elif t == "tool_use":
+                            name = b.get("name", "?")
+                            inp = json.dumps(b.get("input", {}), ensure_ascii=False)
+                            print(f"    [tool_use {name}({inp})]")
         sse = resp.get("sse")
         if sse:
             print(f"  sse: chunks={sse.get('chunks')} bytes={sse.get('bytes')}")
             print(f"       events={sse.get('event_counts')}")
+            if show_prompts and sse.get("raw_stream"):
+                print("  --- raw sse stream ---")
+                for line in sse["raw_stream"].splitlines():
+                    print(f"    {line}")
         usage = resp.get("usage")
         if usage:
             print(f"  usage: {usage}")
@@ -120,6 +205,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", type=Path)
     ap.add_argument("--full", action="store_true", help="detailed block per request")
+    ap.add_argument(
+        "--prompts", action="store_true",
+        help="with --full, also dump the complete prompt/response/SSE bodies "
+             "(requires captures taken with --full-body)",
+    )
     ap.add_argument("--id", help="print raw JSON for a single record")
     ap.add_argument("--limit", type=int, default=50, help="cap number of records shown")
     args = ap.parse_args()
@@ -140,7 +230,7 @@ def main() -> int:
 
     records = records[-args.limit:]
     if args.full:
-        print_full(records)
+        print_full(records, show_prompts=args.prompts)
     else:
         print_summary(records)
     return 0
