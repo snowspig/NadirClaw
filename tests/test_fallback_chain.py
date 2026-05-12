@@ -5,6 +5,33 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 
+# Fallback-chain env vars are loaded from ~/.nadirclaw/.env at import time
+# (settings.py calls load_dotenv on module load). Developers running the
+# suite with a real .env file would see unrelated per-tier keys leak into
+# tests that only monkeypatch a subset. Clear them all up-front so each
+# test starts from a clean slate.
+_FALLBACK_ENV_VARS = (
+    "NADIRCLAW_FALLBACK_CHAIN",
+    "NADIRCLAW_SIMPLE_FALLBACK",
+    "NADIRCLAW_MID_FALLBACK",
+    "NADIRCLAW_COMPLEX_FALLBACK",
+    "NADIRCLAW_REASONING_FALLBACK",
+    "NADIRCLAW_FREE_FALLBACK",
+    "NADIRCLAW_EXPLORE_FALLBACK",
+    "NADIRCLAW_SUBAGENT_FALLBACK",
+    "NADIRCLAW_REVIEW_FALLBACK",
+    "NADIRCLAW_EXECUTION_FALLBACK",
+    "NADIRCLAW_LONG_CONTEXT_FALLBACK",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_fallback_env(monkeypatch):
+    for key in _FALLBACK_ENV_VARS:
+        monkeypatch.delenv(key, raising=False)
+    yield
+
+
 class TestFallbackChainConfig:
     def test_default_chain_includes_tier_models(self):
         """Default chain should include complex and simple models."""
