@@ -180,9 +180,15 @@ def _summarize_messages(body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _summarize_request_body(raw: bytes, content_type: str) -> dict[str, Any]:
-    """Best-effort structural summary of the request body."""
+def _summarize_request_body(raw: bytes, content_type: str, full_body: bool = False) -> dict[str, Any]:
+    """Best-effort structural summary of the request body.
+
+    When `full_body` is true, also include the raw body decoded as UTF-8
+    (with replacement for undecodable bytes) under `raw_body`.
+    """
     info: dict[str, Any] = {"byte_size": len(raw)}
+    if full_body and raw:
+        info["raw_body"] = raw.decode("utf-8", errors="replace")
     if not raw:
         return info
     if "json" not in (content_type or "").lower():
@@ -200,6 +206,8 @@ def _summarize_request_body(raw: bytes, content_type: str) -> dict[str, Any]:
     if isinstance(body, dict) and "messages" in body:
         info["messages_summary"] = _summarize_messages(body)
     info["top_level_keys"] = list(body.keys()) if isinstance(body, dict) else []
+    if full_body:
+        info["body"] = body
     return info
 
 
@@ -255,7 +263,9 @@ class CaptureWriter:
                 fh.write(line + "\n")
 
 
-def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
+def build_app(
+    upstream: str, out_path: Path, max_body_bytes: int, full_body: bool = False,
+) -> FastAPI:
     app = FastAPI(title="capture-proxy")
     writer = CaptureWriter(out_path)
     upstream_url = upstream.rstrip("/")
@@ -303,7 +313,7 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
             fwd_headers[k] = v
 
         content_type = request.headers.get("content-type", "")
-        req_summary = _summarize_request_body(raw, content_type)
+        req_summary = _summarize_request_body(raw, content_type, full_body=full_body)
         client_stream_requested = False
         if req_summary.get("format") == "json":
             ms = req_summary.get("messages_summary") or {}
@@ -326,7 +336,7 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
                     resp_body=body, sse_events=None, usage=None,
                     t_received=t_received, t_send=t_send,
                     t_first_byte=t_done, t_done=t_done,
-                    error=None,
+                    error=None, full_body=full_body,
                 )
             except Exception as exc:
                 t_done = time.time()
@@ -337,7 +347,7 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
                     sse_events=None, usage=None,
                     t_received=t_received, t_send=t_send,
                     t_first_byte=None, t_done=t_done,
-                    error=repr(exc),
+                    error=repr(exc), full_body=full_body,
                 )
                 await writer.write(record)
                 return JSONResponse({"error": str(exc)}, status_code=502)
@@ -368,7 +378,7 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
                 sse_events=None, usage=None,
                 t_received=t_received, t_send=t_send,
                 t_first_byte=None, t_done=t_done,
-                error=repr(exc),
+                error=repr(exc), full_body=full_body,
             )
             await writer.write(record)
             return JSONResponse({"error": str(exc)}, status_code=502)
@@ -385,6 +395,7 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
             first_byte_at: float | None = None
             chunks_total = 0
             bytes_total = 0
+            collected = bytearray() if full_body else None
             error: str | None = None
             try:
                 async for chunk in probe.aiter_raw():
@@ -394,6 +405,8 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
                     bytes_total += len(chunk)
                     _parse_sse_event_types(chunk, sse_counter)
                     _maybe_parse_usage_from_sse(chunk, usage_acc)
+                    if collected is not None:
+                        collected.extend(chunk)
                     yield chunk
             except Exception as exc:
                 error = repr(exc)
@@ -417,7 +430,8 @@ def build_app(upstream: str, out_path: Path, max_body_bytes: int) -> FastAPI:
                     usage=usage_acc or None,
                     t_received=t_received, t_send=t_send,
                     t_first_byte=first_byte_at, t_done=t_done,
-                    error=error,
+                    error=error, full_body=full_body,
+                    sse_raw=bytes(collected) if collected is not None else None,
                 )
                 await writer.write(record)
 
@@ -463,6 +477,8 @@ def _build_record(
     t_first_byte: float | None,
     t_done: float,
     error: str | None,
+    full_body: bool = False,
+    sse_raw: bytes | None = None,
 ) -> dict[str, Any]:
     resp_body_info: dict[str, Any] | None = None
     if resp_body is not None:
@@ -488,12 +504,24 @@ def _build_record(
                         ]
                         if text_parts:
                             resp_body_info["text_excerpt"] = "".join(text_parts)[:600]
+                if full_body:
+                    resp_body_info["body"] = parsed
             except Exception:
                 resp_body_info["format"] = "invalid-json"
                 resp_body_info["excerpt"] = resp_body[:400].decode("utf-8", errors="replace")
+                if full_body:
+                    resp_body_info["raw_body"] = resp_body.decode("utf-8", errors="replace")
         else:
             resp_body_info["format"] = ct or "unknown"
             resp_body_info["excerpt"] = resp_body[:400].decode("utf-8", errors="replace")
+            if full_body:
+                resp_body_info["raw_body"] = resp_body.decode("utf-8", errors="replace")
+
+    sse_info: dict[str, Any] | None = None
+    if sse_events is not None:
+        sse_info = dict(sse_events)
+        if full_body and sse_raw is not None:
+            sse_info["raw_stream"] = sse_raw.decode("utf-8", errors="replace")
 
     return {
         "id": req_id,
@@ -511,7 +539,7 @@ def _build_record(
             "status": status,
             "headers": _redact_headers(resp_headers) if resp_headers else None,
             "body": resp_body_info,
-            "sse": sse_events,
+            "sse": sse_info,
             "usage": usage,
             "error": error,
         },
@@ -540,6 +568,13 @@ def main() -> int:
         "--max-body-bytes", type=int, default=10 * 1024 * 1024,
         help="reject requests with bodies larger than this (default 10 MiB)",
     )
+    ap.add_argument(
+        "--full-body", action="store_true",
+        help="record full request/response bodies verbatim (incl. raw SSE "
+             "stream for streaming responses). Auth headers stay redacted, "
+             "but any secrets that appear inside prompt/response text WILL "
+             "be written to disk.",
+    )
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -549,9 +584,11 @@ def main() -> int:
     )
 
     out_path = Path(args.out).resolve()
-    app = build_app(args.upstream, out_path, args.max_body_bytes)
+    app = build_app(args.upstream, out_path, args.max_body_bytes, full_body=args.full_body)
     logger.info("capture proxy ready: %s -> %s", f"http://{args.host}:{args.port}", args.upstream)
     logger.info("writing captures to: %s", out_path)
+    if args.full_body:
+        logger.warning("--full-body ON: request/response bodies will be written verbatim")
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
