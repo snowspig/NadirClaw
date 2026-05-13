@@ -57,11 +57,11 @@ _MODEL_PROVIDER_PATTERNS = {
     "minimax/": "minimax",
     "glm-": "zai",
     "hosted_vllm/": "hosted_vllm",
+    "deepseek/": "deepseek",
     "cohere/": "cohere",
     "mistral/": "mistral",
     "together_ai/": "together_ai",
     "replicate/": "replicate",
-    "deepseek/": "deepseek",
 }
 
 
