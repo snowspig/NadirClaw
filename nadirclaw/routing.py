@@ -152,6 +152,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "o4-mini": {"context_window": 200_000, "cost_per_m_input": 1.10, "cost_per_m_output": 4.40, "has_vision": True},
     "openai-codex/gpt-5.3-codex": {"context_window": 400_000, "cost_per_m_input": 1.75, "cost_per_m_output": 14.00, "has_vision": False},
     # Anthropic
+    "claude-opus-4-7": {"context_window": 200_000, "cost_per_m_input": 15.00, "cost_per_m_output": 75.00, "has_vision": True},
     "claude-opus-4-6-20250918": {"context_window": 200_000, "cost_per_m_input": 5.00, "cost_per_m_output": 25.00, "has_vision": True},
     "claude-sonnet-4-6": {"context_window": 200_000, "cost_per_m_input": 3.00, "cost_per_m_output": 15.00, "has_vision": True},
     "claude-haiku-4-5-20251001": {"context_window": 200_000, "cost_per_m_input": 1.00, "cost_per_m_output": 5.00, "has_vision": True},
@@ -186,7 +187,7 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
 
 MODEL_ALIASES: Dict[str, str] = {
     "sonnet": "claude-sonnet-4-6",
-    "opus": "claude-opus-4-6",
+    "opus": "claude-opus-4-7",
     "haiku": "claude-haiku-4-5-20251001",
     "claude": "claude-sonnet-4-6",
     "claude-opus-4-6": "claude-opus-4-6-20250918",
@@ -1219,13 +1220,27 @@ def apply_routing_modifiers(
         last_message_is_tool, last_user_text[:100] if last_user_text else "",
     )
 
-    # IMPORTANT: Skip reasoning detection only if the last message is a tool result
-    # When the last message is a tool result, we're processing tool output, not new user input.
-    # But if the user sends a NEW prompt (even with tool results in history),
-    # we should still detect reasoning in that new prompt.
-    if last_message_is_tool:
+    # IMPORTANT: For main sessions, always check reasoning even when
+    # last_message_is_tool. In Claude Code's agentic loop, most turns end
+    # with tool results — but the user's original reasoning request is in
+    # earlier user messages. Only skip for non-main sessions where tool
+    # result processing doesn't carry reasoning intent.
+    if last_message_is_tool and not is_main_session:
         reasoning = {"is_reasoning": False, "marker_count": 0, "markers": [], "skipped": "last_message_is_tool_result"}
         logger.debug("Reasoning skipped: last message is tool result")
+    elif last_message_is_tool and is_main_session:
+        # Main session: check recent user messages for reasoning markers
+        # (the user's reasoning request is in earlier messages, not the tool result)
+        recent_texts = all_user_texts[-3:] if len(all_user_texts) >= 3 else all_user_texts
+        combined_text = " ".join(
+            re.sub(r'<system-reminder>.*?</system-reminder>', '', t, flags=re.DOTALL).strip()
+            for t in recent_texts
+        )
+        reasoning = detect_reasoning(combined_text, system_text)
+        logger.debug(
+            "Main session reasoning check (last is tool): is_reasoning=%s, markers=%s, checked=%d user msgs",
+            reasoning["is_reasoning"], reasoning["markers"], len(recent_texts),
+        )
     else:
         reasoning = detect_reasoning(last_user_text_clean, system_text)
         logger.debug(
@@ -1275,6 +1290,15 @@ def apply_routing_modifiers(
         message_count=message_count,
         system_prompt_length=request_meta.get("system_prompt_length", 0),
     )
+    # Main session: lower threshold since agentic override is skipped
+    if is_main_session and not complex_coding["is_complex"]:
+        main_threshold = _settings.COMPLEX_THRESHOLD * 0.5
+        if complex_coding["confidence"] >= main_threshold:
+            complex_coding = {**complex_coding, "is_complex": True, "threshold_lowered": "main_session"}
+            logger.debug(
+                "Main session: complex threshold lowered %.2f → %.2f, confidence=%.2f triggers",
+                _settings.COMPLEX_THRESHOLD, main_threshold, complex_coding["confidence"],
+            )
     routing_info["complex_coding"] = complex_coding
 
     # Only upgrade to complex if not already reasoning/planning

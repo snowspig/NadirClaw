@@ -173,6 +173,15 @@ def _convert_builtin_tool(tool: Dict[str, Any]) -> Dict[str, Any]:
     return tool
 
 
+def _get_ppchat_domains() -> list[str]:
+    """Get alternate ppchat domains for 429 failover."""
+    raw = os.getenv("NADIRCLAW_PPCHAT_DOMAINS", "")
+    if not raw:
+        return []
+    prefix = "https://"
+    return [d if d.startswith(prefix) else prefix + d for d in raw.split(",") if d.strip()]
+
+
 async def call_anthropic_direct(
     api_base: str,
     api_key: str,
@@ -186,10 +195,19 @@ async def call_anthropic_direct(
     Forwards the original Anthropic request body verbatim and returns the
     raw Anthropic response.  This avoids the Anthropic→OpenAI→Anthropic
     double-conversion that can cause format issues on some providers.
+
+    On 429 (rate limit), retries with exponential backoff and rotates
+    through alternate domains from NADIRCLAW_PPCHAT_DOMAINS.
     """
     from nadirclaw import minimax_recorder
 
-    url = f"{api_base}/v1/messages"
+    max_retries = int(os.getenv("NADIRCLAW_429_RETRIES", "3"))
+    base_backoff = float(os.getenv("NADIRCLAW_429_BACKOFF", "15"))
+
+    # Build candidate URLs: primary domain first, then alternates
+    primary_url = f"{api_base}/v1/messages?beta=true"
+    alt_domains = [d for d in _get_ppchat_domains() if d != api_base.rstrip("/")]
+    candidate_urls = [primary_url] + [f"{d}/v1/messages?beta=true" for d in alt_domains]
 
     # Open MiniMax trace context (no-op for non-MiniMax or when disabled)
     trace_ctx = minimax_recorder.begin_turn(
@@ -221,34 +239,65 @@ async def call_anthropic_direct(
         ant_body["stop_sequences"] = body["stop_sequences"]
     if body.get("metadata"):
         ant_body["metadata"] = body["metadata"]
+    if body.get("output_config"):
+        ant_body["output_config"] = body["output_config"]
 
     headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    # Forward beta headers if present
     beta = body.get("anthropic_beta", "")
     if beta:
         headers["anthropic-beta"] = beta
 
-    logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
-    # Debug dump: log request body to file for analysis
+    logger.debug("Direct Anthropic call: model=%s url=%s beta=%s", model, primary_url, headers.get("anthropic-beta", "(none)")[:60])
     import pathlib
     _dump_path = pathlib.Path.home() / ".nadirclaw" / "debug_last_request.json"
     _dump_path.write_text(json.dumps(ant_body, default=str, ensure_ascii=False)[:100000])
-    # Short connect timeout (5s) to fail fast on network issues;
-    # long read timeout for large model responses.
     client_timeout = httpx.Timeout(timeout, connect=5.0)
 
-    try:
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            resp = await client.post(url, headers=headers, json=ant_body)
-    except Exception as exc:
-        minimax_recorder.end_turn(trace_ctx, raw_response={}, error=str(exc))
-        raise
+    resp = None
+    for attempt in range(max_retries + 1):
+        url = candidate_urls[attempt % len(candidate_urls)]
+        try:
+            async with httpx.AsyncClient(timeout=client_timeout) as client:
+                resp = await client.post(url, headers=headers, json=ant_body)
+        except Exception as exc:
+            if attempt < max_retries:
+                backoff = base_backoff * (2 ** attempt)
+                logger.info(
+                    "Retry %s (network error, attempt %d/%d, %.0fs): %s",
+                    model, attempt + 1, max_retries, backoff, exc,
+                )
+                await asyncio.sleep(backoff)
+                continue
+            minimax_recorder.end_turn(trace_ctx, raw_response={}, error=str(exc))
+            raise
 
-    if resp.status_code >= 400:
+        if resp.status_code < 400:
+            raw_json = resp.json()
+            minimax_recorder.end_turn(trace_ctx, raw_response=raw_json, error=None)
+            if attempt > 0:
+                logger.info("Retrying %s succeeded on attempt %d", model, attempt + 1)
+            return raw_json
+
+        # 429: retry with exponential backoff + domain rotation
+        if resp.status_code == 429 and attempt < max_retries:
+            backoff = base_backoff * (2 ** attempt)
+            host = url.split("//")[1].split("/")[0]
+            logger.warning(
+                "429 on %s via %s (attempt %d/%d, wait %.0fs): %.80s",
+                model, host, attempt + 1, max_retries, backoff, resp.text[:80],
+            )
+            await asyncio.sleep(backoff)
+            continue
+
+        # Non-retriable error (400, 401, 500, or final 429)
+        break
+
+    # If we get here, resp is set and status >= 400
+    if resp is not None and resp.status_code >= 400:
         error_text = resp.text[:500]
         logger.warning(
             "Direct Anthropic call failed (%s): %s", resp.status_code, error_text,
@@ -279,10 +328,6 @@ async def call_anthropic_direct(
         raise LiteLLMInternalServerError(
             message=error_text, model=model, llm_provider="anthropic",
         )
-
-    raw_json = resp.json()
-    minimax_recorder.end_turn(trace_ctx, raw_response=raw_json, error=None)
-    return raw_json
 
 
 # Pattern to strip system-reminder tags from display text.
@@ -977,6 +1022,11 @@ async def anthropic_messages(raw_request: Request):
             detail=f"Rate limit exceeded. Retry after {retry_after}s.",
             headers={"Retry-After": str(retry_after)},
         )
+
+    # Forward anthropic-beta header from Claude Code into body
+    ant_beta_header = raw_request.headers.get("anthropic-beta", "")
+    if ant_beta_header and not body.get("anthropic_beta"):
+        body["anthropic_beta"] = ant_beta_header
 
     # Extract Anthropic fields
     ant_model = body.get("model", "")

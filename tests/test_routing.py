@@ -75,7 +75,7 @@ class TestResolveAlias:
         assert resolve_alias("sonnet") == "claude-sonnet-4-5-20250929"
 
     def test_opus(self):
-        assert resolve_alias("opus") == "claude-opus-4-6-20250918"
+        assert resolve_alias("opus") == "claude-opus-4-7"
 
     def test_gpt4(self):
         assert resolve_alias("gpt4") == "gpt-4.1"

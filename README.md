@@ -628,7 +628,7 @@ Use short names instead of full model IDs:
 | Alias | Resolves To |
 |---|---|
 | `sonnet` | `claude-sonnet-4-5-20250929` |
-| `opus` | `claude-opus-4-6-20250918` |
+| `opus` | `claude-opus-4-7` |
 | `haiku` | `claude-haiku-4-5-20251001` |
 | `gpt4` | `gpt-4.1` |
 | `gpt5` | `gpt-5.2` |

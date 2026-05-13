@@ -288,6 +288,22 @@ class Settings:
             return 0
 
     @property
+    def PROVIDER_HEALTH_COOLDOWN_SECONDS(self) -> int:
+        """Cooldown period after consecutive failures before retrying a model."""
+        try:
+            return max(1, int(os.getenv("NADIRCLAW_PROVIDER_HEALTH_COOLDOWN_SECONDS", "120")))
+        except ValueError:
+            return 120
+
+    @property
+    def PROVIDER_HEALTH_FAILURE_THRESHOLD(self) -> int:
+        """Consecutive failures before marking a model as cooling down."""
+        try:
+            return max(1, int(os.getenv("NADIRCLAW_PROVIDER_HEALTH_FAILURE_THRESHOLD", "2")))
+        except ValueError:
+            return 2
+
+    @property
     def has_explicit_tiers(self) -> bool:
         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""
         return bool(
@@ -316,6 +332,7 @@ class Settings:
         # Claude Code queries /v1/models to verify its selected model exists.
         # Expose common Claude model IDs so CC doesn't reject them.
         for alias in [
+            "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",

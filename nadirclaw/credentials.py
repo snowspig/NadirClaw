@@ -25,6 +25,10 @@ _ENV_VAR_MAP = {
     "google": "GOOGLE_API_KEY",
     "cohere": "COHERE_API_KEY",
     "mistral": "MISTRAL_API_KEY",
+    "zai": "ZAI_API_KEY",
+    "kimi": "KIMI_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "hosted_vllm": "HOSTED_VLLM_API_KEY",
 }
 
 # Alternative env vars checked as fallback (order matters)
@@ -47,10 +51,17 @@ _MODEL_PROVIDER_PATTERNS = {
     "gemini-": "google",
     "antigravity/": "antigravity",
     "ollama/": "ollama",
+    "zai/": "zai",
+    "kimi": "kimi",
+    "minimax-": "minimax",
+    "minimax/": "minimax",
+    "glm-": "zai",
+    "hosted_vllm/": "hosted_vllm",
     "cohere/": "cohere",
     "mistral/": "mistral",
     "together_ai/": "together_ai",
     "replicate/": "replicate",
+    "deepseek/": "deepseek",
 }
 
 

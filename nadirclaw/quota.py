@@ -22,6 +22,7 @@ logger = logging.getLogger("nadirclaw.quota")
 # Normal: standard request cost
 # High token: cost when total tokens > threshold (Anthropic doubles pricing at 125k)
 QUOTA_COSTS = {
+    "claude-opus-4-7": {"normal": 35, "high_token": 70, "threshold": 125000},
     "claude-opus-4-6": {"normal": 35, "high_token": 70, "threshold": 125000},
     "claude-sonnet-4-6": {"normal": 20, "high_token": 40, "threshold": 125000},
     # Future support (not currently used)
@@ -32,7 +33,7 @@ QUOTA_COSTS = {
 OPUS_TO_SONNET_TOKEN_THRESHOLD = 96000
 
 # Models that share ppchat quota (suspend together when ppchat quota exhausted)
-PPCHAT_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6", "openai-codex/gpt-5.4"}
+PPCHAT_MODELS = {"claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "openai-codex/gpt-5.4"}
 
 
 class QuotaTracker:

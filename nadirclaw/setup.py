@@ -33,7 +33,7 @@ PROVIDER_INFO: Dict[str, Dict] = {
     },
     "anthropic": {
         "display": "Anthropic",
-        "description": "Claude Opus 4.6, Sonnet 4.5, Haiku 4.5",
+        "description": "Claude Opus 4.7, Sonnet 4.5, Haiku 4.5",
         "env_var": "ANTHROPIC_API_KEY",
         "key_prefix": "sk-ant-",
         "oauth": True,

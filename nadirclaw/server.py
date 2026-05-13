@@ -1078,6 +1078,12 @@ async def _call_litellm(
         call_kwargs["api_base"] = settings.API_BASE
 
     logger.debug("Calling LiteLLM: model=%s (provider=%s) api_base=%s", litellm_model, provider, call_kwargs.get("api_base", "none"))
+
+    # Explicit timeout: Opus via ppchat often needs 60-120s for first token.
+    # Without this, LiteLLM uses a short default and triggers premature fallback.
+    request_timeout = int(os.getenv("NADIRCLAW_REQUEST_TIMEOUT", "600"))
+    call_kwargs["timeout"] = request_timeout
+
     try:
         response = await litellm.acompletion(**call_kwargs)
     except Exception as e:
@@ -1234,18 +1240,28 @@ async def _call_with_fallback(
     Returns (response_data, actual_model_used, updated_analysis_info).
     """
     from nadirclaw.credentials import detect_provider
+    from nadirclaw.provider_health import provider_health_tracker
 
     try:
         response_data = await _dispatch_model(selected_model, request, provider)
+        provider_health_tracker.record_success(selected_model)
         return response_data, selected_model, analysis_info
     except (RateLimitExhausted, Exception) as primary_error:
         if isinstance(primary_error, HTTPException):
             raise  # Don't fallback on validation/auth errors
 
+        error_type = type(primary_error).__name__
+        provider_health_tracker.record_failure(
+            selected_model, error_type, str(primary_error)[:200],
+        )
+
         # Build fallback chain: use per-tier chain if configured, else global
         tier = analysis_info.get("tier", "")
         full_chain = settings.get_tier_fallback_chain(tier) if tier else settings.FALLBACK_CHAIN
         chain = [m for m in full_chain if m != selected_model]
+
+        # Reorder chain: healthy models first, cooling-down models last
+        chain = provider_health_tracker.ordered_candidates(chain)
 
         if not chain:
             if isinstance(primary_error, RateLimitExhausted):
@@ -1255,10 +1271,16 @@ async def _call_with_fallback(
         failed_models = [selected_model]
         last_error = primary_error
         fallback_reasons: list[dict[str, str]] = [
-            {"model": selected_model, "reason": str(primary_error)[:200], "path": "primary"}
+            {"model": selected_model, "error_type": error_type, "reason": str(primary_error)[:200], "path": "primary"}
         ]
 
         for fallback_model in chain:
+            if not provider_health_tracker.is_available(fallback_model):
+                logger.info(
+                    "⏭ Skipping %s (provider health cooldown)", fallback_model,
+                )
+                continue
+
             logger.warning(
                 "⚡ %s failed (%s) — trying fallback %s (%d/%d in chain)",
                 selected_model if len(failed_models) == 1 else failed_models[-1],
@@ -1273,6 +1295,7 @@ async def _call_with_fallback(
                 response_data = await _dispatch_model(
                     fallback_model, request, fallback_provider,
                 )
+                provider_health_tracker.record_success(fallback_model)
                 analysis_info = {
                     **analysis_info,
                     "fallback_from": selected_model,
@@ -1285,9 +1308,14 @@ async def _call_with_fallback(
             except (RateLimitExhausted, Exception) as chain_error:
                 if isinstance(chain_error, HTTPException):
                     raise
+                ce_type = type(chain_error).__name__
+                provider_health_tracker.record_failure(
+                    fallback_model, ce_type, str(chain_error)[:200],
+                )
                 failed_models.append(fallback_model)
                 fallback_reasons.append({
                     "model": fallback_model,
+                    "error_type": ce_type,
                     "reason": str(chain_error)[:200],
                     "path": "fallback",
                 })
@@ -2921,16 +2949,28 @@ def _sanitize_anthropic_messages(messages: list) -> list:
 
 async def _call_anthropic_direct(api_base: str, api_key: str, model: str,
                                   body: dict, timeout: float = 600.0) -> dict:
-    """Call Anthropic-compatible endpoint directly, no format conversion."""
+    """Call Anthropic-compatible endpoint directly, with 429 retry + domain rotation."""
     import httpx
-    url = f"{api_base}/v1/messages"
+    import os as _os
+
+    max_retries = int(_os.getenv("NADIRCLAW_429_RETRIES", "3"))
+    base_backoff = float(_os.getenv("NADIRCLAW_429_BACKOFF", "15"))
+
+    # Build candidate URLs with alternate domains
+    primary_url = f"{api_base}/v1/messages?beta=true"
+    raw_domains = _os.getenv("NADIRCLAW_PPCHAT_DOMAINS", "")
+    prefix = "https://"
+    alt_domains = [d if d.startswith(prefix) else prefix + d
+                   for d in raw_domains.split(",") if d.strip()]
+    alt_domains = [d for d in alt_domains if d != api_base.rstrip("/")]
+    candidate_urls = [primary_url] + [f"{d}/v1/messages?beta=true" for d in alt_domains]
 
     ant_body = {"model": model, "max_tokens": body.get("max_tokens", 4096)}
     for key in ("system", "tools", "tool_choice", "thinking",
-                "temperature", "top_p", "stop_sequences", "metadata"):
+                "temperature", "top_p", "stop_sequences", "metadata",
+                "output_config"):
         if key in body and body[key]:
             ant_body[key] = body[key]
-    # Sanitize messages for provider quirks
     if "messages" in body:
         ant_body["messages"] = _sanitize_anthropic_messages(body["messages"])
 
@@ -2939,12 +2979,40 @@ async def _call_anthropic_direct(api_base: str, api_key: str, model: str,
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    logger.debug("Direct Anthropic call: model=%s url=%s", model, url)
+    beta = body.get("anthropic_beta", "")
+    if beta:
+        headers["anthropic-beta"] = beta
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(url, headers=headers, json=ant_body)
+    resp = None
+    for attempt in range(max_retries + 1):
+        url = candidate_urls[attempt % len(candidate_urls)]
+        host = url.split("//")[1].split("/")[0]
+        logger.debug("Direct Anthropic call: model=%s attempt=%d/%d host=%s", model, attempt + 1, max_retries + 1, host)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(url, headers=headers, json=ant_body)
+        except Exception as exc:
+            if attempt < max_retries:
+                backoff = base_backoff * (2 ** attempt)
+                logger.info("Retry %s (network error, attempt %d/%d, %.0fs)", model, attempt + 1, max_retries, backoff)
+                await asyncio.sleep(backoff)
+                continue
+            raise
 
-    if resp.status_code >= 400:
+        if resp.status_code < 400:
+            if attempt > 0:
+                logger.info("Retrying %s succeeded on attempt %d via %s", model, attempt + 1, host)
+            return resp.json()
+
+        if resp.status_code == 429 and attempt < max_retries:
+            backoff = base_backoff * (2 ** attempt)
+            logger.warning("429 on %s via %s (attempt %d/%d, wait %.0fs)", model, host, attempt + 1, max_retries, backoff)
+            await asyncio.sleep(backoff)
+            continue
+
+        break
+
+    if resp is not None and resp.status_code >= 400:
         error_text = resp.text[:500]
         logger.warning("Direct Anthropic call failed (%s): %s", resp.status_code, error_text)
         from litellm.exceptions import (
@@ -2955,6 +3023,4 @@ async def _call_anthropic_direct(api_base: str, api_key: str, model: str,
                    429: RateLimitError}
         exc_cls = exc_map.get(resp.status_code, InternalServerError)
         raise exc_cls(message=error_text, model=model, llm_provider="anthropic")
-
-    return resp.json()
 
